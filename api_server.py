@@ -352,13 +352,27 @@ class MeasurementAnnotation(BaseModel):
     end_x: float    # End point X in drawing units
     end_y: float    # End point Y in drawing units
     value: float    # Measurement value in mm
-    label: Optional[str] = None  # Optional custom label
+    label: Optional[str] = None  # Optional custom label (overrides auto-generated)
+    color: Optional[str] = "red"  # Color for this measurement (red, blue, green, etc.)
+
+
+class BoundaryRectangle(BaseModel):
+    """A boundary rectangle to draw on an image (e.g., room perimeter)."""
+    min_x: float  # Bottom-left X in drawing units
+    min_y: float  # Bottom-left Y in drawing units
+    max_x: float  # Top-right X in drawing units
+    max_y: float  # Top-right Y in drawing units
+    color: Optional[str] = "red"  # Color for the rectangle
+    line_width: Optional[int] = 3  # Line width in pixels
 
 
 class AnnotatedExportRequest(BaseModel):
     """Request to export an image with measurement annotations."""
-    region_id: Optional[str] = None  # Region to export (if None, exports full drawing)
-    measurements: list[MeasurementAnnotation]  # Measurements to annotate
+    region_id: Optional[str] = None  # Region to export (by detected region ID)
+    region: Optional[Bounds] = None  # Custom region bounds to export (takes precedence over region_id)
+    measurements: list[MeasurementAnnotation] = []  # Measurements to annotate
+    boundaries: list[BoundaryRectangle] = []  # Boundary rectangles to draw
+    unit_format: Optional[str] = "mm"  # "mm" or "m" - affects auto-generated labels
     backend: RenderBackend = RenderBackend.LIBRECAD
 
 
@@ -851,14 +865,18 @@ async def get_dimensions(
         midpoint = None
 
         try:
-            p1 = entity.dxf.defpoint
+            # For linear dimensions:
+            # - defpoint2 is the start point of the first extension line (actual measured point 1)
+            # - defpoint3 is the start point of the second extension line (actual measured point 2)
+            # - defpoint is the dimension line location, NOT a measurement point
             p2 = entity.dxf.defpoint2
+            p3 = entity.dxf.defpoint3
             point_from = Point(x=p2.x, y=p2.y, z=getattr(p2, 'z', 0.0))
-            point_to = Point(x=p1.x, y=p1.y, z=getattr(p1, 'z', 0.0))
+            point_to = Point(x=p3.x, y=p3.y, z=getattr(p3, 'z', 0.0))
             midpoint = Point(
-                x=(p1.x + p2.x) / 2,
-                y=(p1.y + p2.y) / 2,
-                z=(getattr(p1, 'z', 0.0) + getattr(p2, 'z', 0.0)) / 2
+                x=(p2.x + p3.x) / 2,
+                y=(p2.y + p3.y) / 2,
+                z=(getattr(p2, 'z', 0.0) + getattr(p3, 'z', 0.0)) / 2
             )
         except:
             pass
@@ -1107,8 +1125,9 @@ def draw_measurement_annotation(
     img,
     start_point: tuple[int, int],  # (x, y) in pixels
     end_point: tuple[int, int],    # (x, y) in pixels
-    value: float,                   # measurement value
-    unit: str = "mm",
+    value: float,                   # measurement value in mm
+    unit_format: str = "mm",        # "mm" or "m"
+    label: str = None,              # Custom label (overrides auto-generated)
     color: tuple = (255, 0, 0),    # Red
     line_width: int = 3
 ):
@@ -1142,10 +1161,15 @@ def draw_measurement_annotation(
     midy = (y1 + y2) / 2
 
     # Format measurement text
-    if value >= 1000:
-        text = f"{value/1000:.2f} m"
+    if label:
+        text = label
+    elif unit_format == "m":
+        # Convert mm to meters
+        value_m = value / 1000.0
+        text = f"{value_m:.2f}m"
     else:
-        text = f"{value:.0f} {unit}"
+        # Keep as mm
+        text = f"{value:.0f} mm"
 
     # Try to load a font, fall back to default
     try:
@@ -1171,6 +1195,26 @@ def draw_measurement_annotation(
 
     # Draw text
     draw.text((text_x, text_y), text, fill=color, font=font)
+
+    return img
+
+
+def draw_boundary_rectangle(
+    img,
+    top_left: tuple[int, int],     # (x, y) in pixels
+    bottom_right: tuple[int, int], # (x, y) in pixels
+    color: tuple = (255, 0, 0),    # Red
+    line_width: int = 3
+):
+    """Draw a boundary rectangle on an image."""
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(img)
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+
+    # Draw rectangle outline
+    draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
 
     return img
 
@@ -1752,8 +1796,14 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
     doc, msp, cache = data['doc'], data['msp'], data['cache']
     dxf_filepath = data['filepath']
 
-    # Determine bounds (region or full drawing)
-    if request.region_id:
+    # Determine bounds (custom region > region_id > full drawing)
+    use_region_crop = False
+    if request.region:
+        # Custom region bounds take precedence
+        x_min, x_max = request.region.min.x, request.region.max.x
+        y_min, y_max = request.region.min.y, request.region.max.y
+        use_region_crop = True
+    elif request.region_id:
         regions = detect_regions(msp, cache)
         target_region = None
         for r in regions:
@@ -1765,6 +1815,7 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
         bounds = target_region['bounds']
         x_min, x_max = bounds.min.x, bounds.max.x
         y_min, y_max = bounds.min.y, bounds.max.y
+        use_region_crop = True
     else:
         bbox = ezdxf_bbox.extents(msp, cache=cache)
         x_min, x_max = bbox.extmin.x, bbox.extmax.x
@@ -1786,7 +1837,7 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
         temp_full_path = os.path.join(EXPORT_DIR, f"temp_{uuid.uuid4().hex[:8]}.png")
         success = export_with_librecad(dxf_filepath, temp_full_path, width=6000, height=4000)
 
-        if success and request.region_id:
+        if success and use_region_crop:
             # Crop to region
             drawing_bounds = (
                 overall_bbox.extmin.x,
@@ -1848,22 +1899,49 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
         _, _, actual_bounds = export_with_ezdxf(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath)
         x_min, x_max, y_min, y_max = actual_bounds
 
-    # Now annotate with measurements
+    # Now annotate with measurements and boundaries
     annotated_filename = f"annotated_{uuid.uuid4().hex[:8]}.png"
     annotated_filepath = os.path.join(EXPORT_DIR, annotated_filename)
 
-    dimensions = []
-    for m in request.measurements:
-        dimensions.append({
-            'start': (m.start_x, m.start_y),
-            'end': (m.end_x, m.end_y),
-            'value': m.value
-        })
+    from PIL import Image
 
-    img_bounds = (x_min, x_max, y_min, y_max)
-    width, height = annotate_image_with_dimensions(
-        base_filepath, annotated_filepath, dimensions, img_bounds
-    )
+    with Image.open(base_filepath) as img:
+        img = img.convert('RGB')
+        img_width, img_height = img.size
+        drawing_width = x_max - x_min
+        drawing_height = y_max - y_min
+
+        def dwg_to_px(dwg_x, dwg_y):
+            """Convert drawing coordinates to pixel coordinates."""
+            px = int((dwg_x - x_min) / drawing_width * img_width)
+            py = int((y_max - dwg_y) / drawing_height * img_height)  # Y inverted
+            return px, py
+
+        # Draw boundary rectangles first (so they appear behind measurements)
+        for boundary in request.boundaries:
+            color = get_color_tuple(boundary.color or "red")
+            top_left = dwg_to_px(boundary.min_x, boundary.max_y)
+            bottom_right = dwg_to_px(boundary.max_x, boundary.min_y)
+            img = draw_boundary_rectangle(
+                img, top_left, bottom_right,
+                color=color,
+                line_width=boundary.line_width or 3
+            )
+
+        # Draw measurements
+        for m in request.measurements:
+            color = get_color_tuple(m.color or "red")
+            px_start = dwg_to_px(m.start_x, m.start_y)
+            px_end = dwg_to_px(m.end_x, m.end_y)
+            img = draw_measurement_annotation(
+                img, px_start, px_end, m.value,
+                unit_format=request.unit_format or "mm",
+                label=m.label,
+                color=color
+            )
+
+        img.save(annotated_filepath, 'PNG')
+        final_width, final_height = img.size
 
     # Clean up base image
     try:
@@ -1874,9 +1952,9 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
     return AnnotatedExportResponse(
         url=f"/exports/{annotated_filename}",
         filename=annotated_filename,
-        width=width,
-        height=height,
-        measurements_drawn=len(dimensions)
+        width=final_width,
+        height=final_height,
+        measurements_drawn=len(request.measurements)
     )
 
 
@@ -2115,10 +2193,11 @@ async def query_point(drawing_id: str, query: PointQuery):
 
         elif entity_type == "DIMENSION":
             try:
-                p1 = entity.dxf.defpoint
+                # Use defpoint2 and defpoint3 for actual measurement points
                 p2 = entity.dxf.defpoint2
-                dx = p1.x - p2.x
-                dy = p1.y - p2.y
+                p3 = entity.dxf.defpoint3
+                dx = p3.x - p2.x
+                dy = p3.y - p2.y
                 value = math.sqrt(dx*dx + dy*dy)
                 nearby_dimensions.append(DimensionInfo(
                     id="",
@@ -2266,14 +2345,18 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
         midpoint = None
 
         try:
-            p1 = entity.dxf.defpoint
+            # For linear dimensions:
+            # - defpoint2 is the start point of the first extension line (actual measured point 1)
+            # - defpoint3 is the start point of the second extension line (actual measured point 2)
+            # - defpoint is the dimension line location, NOT a measurement point
             p2 = entity.dxf.defpoint2
+            p3 = entity.dxf.defpoint3
             point_from = Point(x=p2.x, y=p2.y, z=getattr(p2, 'z', 0.0))
-            point_to = Point(x=p1.x, y=p1.y, z=getattr(p1, 'z', 0.0))
+            point_to = Point(x=p3.x, y=p3.y, z=getattr(p3, 'z', 0.0))
             midpoint = Point(
-                x=(p1.x + p2.x) / 2,
-                y=(p1.y + p2.y) / 2,
-                z=(getattr(p1, 'z', 0.0) + getattr(p2, 'z', 0.0)) / 2
+                x=(p2.x + p3.x) / 2,
+                y=(p2.y + p3.y) / 2,
+                z=(getattr(p2, 'z', 0.0) + getattr(p3, 'z', 0.0)) / 2
             )
         except:
             pass
@@ -2393,8 +2476,9 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
                 x_min, x_max = bbox.extmin.x, bbox.extmax.x
                 y_min, y_max = bbox.extmin.y, bbox.extmax.y
 
-        # Add padding
-        padding = max(500, (x_max - x_min) * 0.1)
+        # Add padding (10% of the region size, with a small minimum for very small regions)
+        region_size = max(x_max - x_min, y_max - y_min)
+        padding = max(region_size * 0.05, 0.5)  # 5% padding, minimum 0.5 units
         x_min -= padding
         x_max += padding
         y_min -= padding

@@ -4,6 +4,8 @@ A REST API for analyzing DXF/DWG CAD drawings, extracting dimensions, annotation
 
 **Base URL:** `http://localhost:3000`
 
+> **Note:** For AI assistants - see `llm.txt` for recommended patterns when measuring room dimensions.
+
 ---
 
 ## Quick Start
@@ -622,26 +624,57 @@ Export a specific detected region.
 
 #### `POST /drawings/{drawing_id}/export/annotated`
 
-Export with measurement annotations overlaid.
+Export with measurement annotations and boundary rectangles overlaid.
 
 **Request:**
 
 ```json
 {
-  "region_id": "R001",
-  "measurements": [
+  "region": {
+    "min": {"x": -120000, "y": 27000},
+    "max": {"x": -112000, "y": 35000}
+  },
+  "boundaries": [
     {
-      "start_x": 0.0,
-      "start_y": 0.0,
-      "end_x": 5000.0,
-      "end_y": 0.0,
-      "value": 5000.0,
-      "label": "Wall Length"
+      "min_x": -117779,
+      "min_y": 28570,
+      "max_x": -115379,
+      "max_y": 30290,
+      "color": "red",
+      "line_width": 3
     }
   ],
-  "backend": "librecad"
+  "measurements": [
+    {
+      "start_x": -117779,
+      "start_y": 28270,
+      "end_x": -115379,
+      "end_y": 28270,
+      "value": 2400,
+      "color": "red",
+      "label": "2.40m"
+    }
+  ],
+  "unit_format": "m",
+  "backend": "ezdxf"
 }
 ```
+
+**Parameters:**
+
+- `region` (optional): Custom bounds to crop the export. Takes precedence over `region_id`.
+- `region_id` (optional): ID of a detected region to crop to (from `/regions` endpoint).
+- `boundaries` (optional): List of boundary rectangles to draw (e.g., room perimeters).
+  - `min_x`, `min_y`, `max_x`, `max_y`: Rectangle corners in drawing units.
+  - `color` (optional): Color name (red, blue, green, etc.). Default: red.
+  - `line_width` (optional): Line width in pixels. Default: 3.
+- `measurements` (optional): List of measurement annotations to draw.
+  - `start_x`, `start_y`, `end_x`, `end_y`: Line endpoints in drawing units.
+  - `value`: Measurement value in mm.
+  - `color` (optional): Color name. Default: red.
+  - `label` (optional): Custom label text. If not provided, auto-generated from value.
+- `unit_format` (optional): `"mm"` or `"m"` - affects auto-generated labels. Default: mm.
+- `backend` (optional): `"ezdxf"` or `"librecad"` (default).
 
 **Response:**
 
