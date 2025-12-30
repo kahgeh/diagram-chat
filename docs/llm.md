@@ -4,6 +4,105 @@ This document contains patterns and guidelines for AI assistants working with th
 
 ---
 
+## Quick Reference: New Endpoints
+
+These endpoints provide enhanced capabilities for analyzing drawings:
+
+| Endpoint | Use Case |
+|----------|----------|
+| `GET /drawings/{id}/polylines` | Get wall boundaries as connected line segments |
+| `GET /drawings/{id}/entities` | Unified entity list with bounds and properties |
+| `GET /drawings/{id}/blocks/{name}/contents` | Explode blocks to see internal geometry |
+| `POST /drawings/{id}/entities/query` | Spatial query with filtering and block explosion |
+| `POST /drawings/{id}/boundaries/detect` | Auto-detect closed room perimeters |
+
+---
+
+## Counting Rooms (e.g., "How many bathrooms?")
+
+### Strategy 1: Search Text Annotations
+
+Look for room labels in text annotations:
+
+```bash
+curl -s ".../annotations" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+keywords = ['BATH', 'WC', 'TOILET', 'BANYO', 'LAVABO', 'SS.HH.']
+for a in data:
+    text = a.get('content', '').upper()
+    if any(kw in text for kw in keywords):
+        print(f\"{a['content']} at ({a['position']['x']:.0f}, {a['position']['y']:.0f})\")
+"
+```
+
+### Strategy 2: Search Block Names for Fixtures
+
+Many drawings use named blocks for fixtures:
+
+```bash
+curl -s ".../blocks" | python3 -c "
+import json, sys
+from collections import Counter
+data = json.load(sys.stdin)
+
+# Find bathroom-related blocks
+keywords = ['TOILET', 'WC', 'SINK', 'BASIN', 'BATH', 'TUB', 'SHOWER', 'LAVABO']
+bathroom_blocks = [b for b in data if any(kw in b['block_name'].upper() for kw in keywords)]
+
+# Group by location to identify unique bathrooms
+print(f'Found {len(bathroom_blocks)} bathroom fixture blocks')
+for b in bathroom_blocks:
+    print(f\"  {b['block_name']} at ({b['position']['x']:.0f}, {b['position']['y']:.0f})\")
+"
+```
+
+### Strategy 3: Explode Blocks to Identify Fixtures
+
+When block names aren't descriptive, inspect their contents:
+
+```bash
+# List all unique blocks
+curl -s ".../blocks" | python3 -c "
+import json, sys
+from collections import Counter
+data = json.load(sys.stdin)
+counts = Counter(b['block_name'] for b in data)
+for name, count in counts.most_common(20):
+    print(f'{name}: {count}')
+"
+
+# Inspect a specific block's geometry
+curl -s ".../blocks/BLOCK_NAME/contents" | python3 -m json.tool
+```
+
+### Strategy 4: Use Boundary Detection
+
+Detect enclosed rooms automatically:
+
+```bash
+curl -s -X POST ".../boundaries/detect" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "layers": ["WALL", "MURO"],
+    "min_area": 1000000
+  }'
+```
+
+Then correlate detected boundaries with nearby labels and fixtures.
+
+### Strategy 5: Visual Inspection with Cairo Renderer
+
+Export accurate images for visual analysis:
+
+```bash
+curl -s -X POST ".../export" \
+  -H "Content-Type: application/json" \
+  -d '{"backend": "cairo", "width": 4000}'
+```
+
+---
+
 ## Measuring Room Dimensions (Recommended Pattern)
 
 When measuring a specific room (e.g., bathroom, bedroom), **do not rely solely on DIMENSION entities** - they may measure adjacent spaces, wall thicknesses, or unrelated features. Instead, follow this pattern:
@@ -18,40 +117,55 @@ curl -s ".../annotations" | jq '.[] | select(.content == "SS.HH.")'
 
 # Export the area to visually confirm (look for fixtures like toilets, sinks)
 curl -X POST ".../export" -H "Content-Type: application/json" \
-  -d '{"format":"png","width":800,"region":{"min":{"x":163,"y":71},"max":{"x":167,"y":75}}}'
+  -d '{"backend":"cairo","width":1500,"region":{"min":{"x":163,"y":71},"max":{"x":167,"y":75}}}'
 ```
 
 **Important:** Always visually inspect the exported image to confirm you are looking at the correct room. Look for identifying fixtures (toilets, sinks, stoves, beds, etc.).
 
-### Step 2: Find wall lines nearest to fixtures
+### Step 2: Use Spatial Query to Get Wall Geometry
 
-Query the geometry layer for wall lines (typically "MURO" or "WALL" layer):
-
-```bash
-# Get wall lines in the room area
-curl -s ".../geometry?type=line" | jq '[.[] | select(
-  .layer == "MURO" and
-  .start.x > 163 and .start.x < 167 and
-  .start.y > 71 and .start.y < 75
-)]'
-```
-
-### Step 3: Identify vertical and horizontal walls
-
-- **Vertical walls** (same X, different Y): Define left/right room boundaries
-- **Horizontal walls** (same Y, different X): Define top/bottom room boundaries
+Query all wall entities in the room area:
 
 ```bash
-# Find vertical walls (room width boundaries)
-curl -s ".../geometry?type=line" | jq '[.[] | select(.layer == "MURO")
-  | select(((.start.x - .end.x) | fabs) < 0.05)] | [.[].start.x] | sort | unique'
-
-# Find horizontal walls (room depth boundaries)
-curl -s ".../geometry?type=line" | jq '[.[] | select(.layer == "MURO")
-  | select(((.start.y - .end.y) | fabs) < 0.05)] | [.[].start.y] | sort | unique'
+curl -s -X POST ".../entities/query" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bounds": {"min": {"x": 163, "y": 71}, "max": {"x": 167, "y": 75}},
+    "types": ["LINE", "LWPOLYLINE", "POLYLINE"],
+    "layers": ["WALL", "MURO"]
+  }'
 ```
 
-### Step 4: Identify enclosing walls (not just nearest walls)
+### Step 3: Get Closed Polylines (Room Boundaries)
+
+Polylines often represent complete wall boundaries:
+
+```bash
+curl -s ".../polylines?layer=WALL&closed_only=true"
+```
+
+### Step 4: Use Automatic Boundary Detection
+
+Let the API detect closed room perimeters:
+
+```bash
+curl -s -X POST ".../boundaries/detect" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "region": {"min": {"x": 163, "y": 71}, "max": {"x": 167, "y": 75}},
+    "layers": ["WALL", "MURO"],
+    "min_area": 500000,
+    "tolerance": 50
+  }'
+```
+
+The response includes:
+- `vertices`: The boundary polygon points
+- `width`, `height`, `area`: Computed dimensions
+- `nearby_labels`: Text found inside the boundary
+- `is_rectangular`: Whether it's a simple rectangle
+
+### Step 5: Identify enclosing walls (not just nearest walls)
 
 **Critical:** Do not simply pick the nearest vertical/horizontal wall segments to the fixture. Instead, identify walls that form a **closed room boundary**:
 
@@ -71,7 +185,7 @@ curl -s ".../geometry?type=line" | jq '[.[] | select(.layer == "MURO")
 
    These create wall-like lines but are NOT room boundaries.
 
-### Step 5: Apply sanity checks before finalizing
+### Step 6: Apply sanity checks before finalizing
 
 **Red flags that indicate wrong boundaries:**
 - Boundary line passes through the middle of any fixture
@@ -80,24 +194,32 @@ curl -s ".../geometry?type=line" | jq '[.[] | select(.layer == "MURO")
 - No door opening visible on any boundary wall (rooms need entry points)
 - Boundary walls don't form a closed rectangle (missing a side)
 
-### Step 6: Calculate room dimensions from wall coordinates
+### Step 7: Calculate room dimensions from wall coordinates
 
 ```
 Room Width  = rightmost_wall_x - leftmost_wall_x
 Room Depth  = topmost_wall_y - bottommost_wall_y
 ```
 
-### Step 7: Verify by drawing measurements on the image
+### Step 8: Verify by drawing measurements on the image
 
 Always export an annotated image with the calculated measurements overlaid:
 
-1. Draw the room boundary rectangle on the exported image
-2. Visually confirm the rectangle:
-   - Encloses ALL fixtures in the room
-   - Aligns with visible wall lines
-   - Includes door opening location
-   - Does NOT cut through any fixtures
-3. If the boundary looks wrong, return to Step 4 and re-examine wall segments
+```bash
+curl -s -X POST ".../export/annotated" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "region": {"min": {"x": 163, "y": 71}, "max": {"x": 167, "y": 75}},
+    "boundaries": [
+      {"min_x": 163.5, "min_y": 71.5, "max_x": 166.5, "max_y": 74.5, "color": "red"}
+    ],
+    "measurements": [
+      {"start_x": 163.5, "start_y": 71, "end_x": 166.5, "end_y": 71, "value": 3000, "color": "red"}
+    ],
+    "unit_format": "m",
+    "backend": "cairo"
+  }'
+```
 
 **Never report dimensions without visual verification.**
 
@@ -146,6 +268,17 @@ The fixtures drawn in the floor plan are your best validation tool:
 
 ---
 
+## Render Backends
+
+| Backend | When to Use |
+|---------|-------------|
+| `cairo` | Default - accurate Python-native rendering, supports all standard entity types |
+| `librecad` | Complex hatches (requires LibreCAD installed) |
+
+**Recommendation:** Use `cairo` (default) for most cases - it provides accurate rendering of all standard entity types without requiring external dependencies.
+
+---
+
 ## Useful Layer Names
 
 Common layer names in architectural drawings:
@@ -154,20 +287,35 @@ Common layer names in architectural drawings:
 - **TEXTOS PLANTA** / **TEXT** - Text annotations and labels
 - **PUERTAS** / **DOORS** - Door symbols
 - **VENTANAS** / **WINDOWS** - Window symbols
+- **WC** / **SANITARY** / **BATH** - Bathroom fixtures
+
+---
+
+## Example: Counting Bathrooms
+
+1. Search annotations for bathroom labels ("BATH", "WC", "SS.HH.", etc.)
+2. Search blocks for fixture names ("TOILET", "SINK", "TUB", etc.)
+3. If block names are cryptic, explode them to inspect geometry
+4. Use boundary detection to find enclosed rooms
+5. Cross-reference detected boundaries with fixture positions
+6. Export with Cairo for visual verification
+7. Count unique bathroom locations (fixtures clustered together = 1 bathroom)
 
 ---
 
 ## Example: Measuring a Bathroom
 
 1. Search for "SS.HH.", "BATH", "WC" labels in annotations, or locate toilet/sink blocks on SANITARY/WC layers
-2. Export the region around the fixture positions
+2. Export the region around the fixture positions using Cairo backend
 3. Visually confirm you see bathroom fixtures (toilet, sink, bathtub/shower)
-4. Query WALL/MURO layer for wall lines in that region
-5. Identify horizontal walls and note their lengths - longer segments are more likely room boundaries than short partitions
-6. Identify vertical walls that connect to form a closed perimeter with the horizontal walls
+4. Use spatial query to get WALL/MURO entities in that region
+5. Use boundary detection to find the enclosing room perimeter
+6. If boundary detection fails, manually identify wall segments:
+   - Identify horizontal walls and note their lengths - longer segments are more likely room boundaries
+   - Identify vertical walls that connect to form a closed perimeter
 7. Verify the boundary rectangle encloses ALL fixtures and any door swing arcs
 8. Calculate: width = right_x - left_x, depth = top_y - bottom_y
-9. Draw the boundary rectangle on the exported image and verify it:
+9. Export annotated image with boundary rectangle and verify it:
    - Aligns with visible wall lines
    - Contains all fixtures completely (nothing cut off)
    - Includes door opening

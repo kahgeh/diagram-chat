@@ -10,75 +10,143 @@ This skill helps answer questions about architectural floor plans (DXF/DWG files
 ## Prerequisites
 
 Ensure the API server is running:
+
 ```bash
-source .venv/bin/activate && python api_server.py &
+uv run python api_server.py &
 ```
 
-## Workflow for Measuring Rooms
+## Workflow for Counting/Finding Rooms
 
-### Step 1: Load the Drawing
+### Step 1: List Drawings
 
 ```bash
-# Upload a drawing
-curl -X POST "http://localhost:3000/drawings" -F "file=@path/to/file.dxf"
-
-# Or list existing drawings
 curl -s "http://localhost:3000/drawings"
 ```
 
-### Step 2: Identify Regions and Fixtures
+### Step 2: Search for Room Indicators
+
+Use multiple strategies to find rooms like bathrooms:
+
+**Strategy A: Search text annotations for room labels**
 
 ```bash
-# Get detected regions (floor plans, elevations, etc.)
-curl -s "http://localhost:3000/drawings/{id}/regions"
-
-# Find room fixtures (toilets, sinks, etc.) to locate specific rooms
-curl -s "http://localhost:3000/drawings/{id}/blocks?layer=WC"
-curl -s "http://localhost:3000/drawings/{id}/blocks?layer=SANITARY"
+curl -s "http://localhost:3000/drawings/{id}/annotations" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+keywords = ['BATH', 'WC', 'TOILET', 'BANYO', 'LAVABO']
+for a in data:
+    text = a.get('content', '').upper()
+    if any(kw in text for kw in keywords):
+        print(a)
+"
 ```
 
-### Step 3: Export and Visually Verify
+**Strategy B: Search block names for fixtures**
 
-Always export the area first to see what you're measuring:
+```bash
+curl -s "http://localhost:3000/drawings/{id}/blocks" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+keywords = ['TOILET', 'WC', 'SINK', 'BATH', 'TUB', 'SHOWER', 'LAVABO', 'BANYO']
+for b in data:
+    name = b['block_name'].upper()
+    if any(kw in name for kw in keywords):
+        print(b['block_name'], b['position'])
+"
+```
+
+**Strategy C: Explode blocks to find fixture geometry**
+
+```bash
+# First list unique block names
+curl -s "http://localhost:3000/drawings/{id}/blocks" | python3 -c "
+import json, sys
+from collections import Counter
+data = json.load(sys.stdin)
+counts = Counter(b['block_name'] for b in data)
+for name, count in counts.most_common(30):
+    print(f'{name}: {count}')
+"
+
+# Then inspect a specific block's contents
+curl -s "http://localhost:3000/drawings/{id}/blocks/{block_name}/contents"
+```
+
+**Strategy D: Use boundary detection to find enclosed rooms**
+
+```bash
+curl -s -X POST "http://localhost:3000/drawings/{id}/boundaries/detect" \
+  -H "Content-Type: application/json" \
+  -d '{"layers":["WALL","MURO"],"min_area":1000000}'
+```
+
+### Step 3: Get Regions (Floor Plans)
+
+```bash
+curl -s "http://localhost:3000/drawings/{id}/regions"
+```
+
+### Step 4: Export with Cairo for Accurate Visualization
 
 ```bash
 curl -s -X POST "http://localhost:3000/drawings/{id}/export" \
   -H "Content-Type: application/json" \
-  -d '{"format":"png","width":1500,"backend":"ezdxf","region":{"min":{"x":-120000,"y":27000},"max":{"x":-112000,"y":35000}}}'
+  -d '{"backend":"cairo","width":2000,"background":"white"}'
 ```
 
-Download and view the image to confirm you're looking at the correct room.
-
-### Step 4: Query Wall Geometry
-
-Get wall lines to identify room boundaries:
+Or export a specific region:
 
 ```bash
-curl -s "http://localhost:3000/drawings/{id}/geometry?layer=WALL&type=line"
+curl -s -X POST "http://localhost:3000/drawings/{id}/export" \
+  -H "Content-Type: application/json" \
+  -d '{"backend":"cairo","width":2000,"region":{"min":{"x":-120000,"y":27000},"max":{"x":-112000,"y":35000}}}'
 ```
 
-Filter walls in the target area and identify:
-- **Horizontal walls**: Define top/bottom boundaries (same Y, different X)
-- **Vertical walls**: Define left/right boundaries (same X, different Y)
+## Workflow for Measuring Rooms
 
-### Step 5: Identify Enclosing Walls (Critical)
+### Step 1: Identify Room Location
 
-**Do NOT simply pick the nearest wall to a fixture.** Instead:
+Find the room using annotations, blocks, or visual inspection of exports.
 
-1. Look at wall segment lengths - longer segments (2-4m) are more likely room boundaries
-2. Check if walls form a closed perimeter
-3. Verify the boundary contains ALL fixtures (bathtub, toilet, sink)
-4. Look for door swing arcs - room walls have door openings
+### Step 2: Query Geometry in Region
 
-**Red flags for wrong boundaries:**
-- Boundary cuts through a fixture
-- A fixture extends outside the boundary
-- Door swing arc extends outside
-- No door opening on any wall
+Use spatial query to get all entities in a region:
 
-### Step 6: Calculate and Annotate
+```bash
+curl -s -X POST "http://localhost:3000/drawings/{id}/entities/query" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bounds": {"min": {"x": -80000, "y": 20000}, "max": {"x": -70000, "y": 35000}},
+    "types": ["LINE", "LWPOLYLINE", "POLYLINE"],
+    "layers": ["WALL"],
+    "include_nested": false
+  }'
+```
 
-Once you have the correct boundaries, use the annotated export:
+### Step 3: Get Polylines (Wall Boundaries)
+
+Polylines often represent complete wall boundaries:
+
+```bash
+curl -s "http://localhost:3000/drawings/{id}/polylines?layer=WALL&closed_only=true"
+```
+
+### Step 4: Detect Closed Boundaries
+
+Automatically find closed room perimeters:
+
+```bash
+curl -s -X POST "http://localhost:3000/drawings/{id}/boundaries/detect" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "region": {"min": {"x": -80000, "y": 20000}, "max": {"x": -70000, "y": 35000}},
+    "layers": ["WALL"],
+    "min_area": 500000,
+    "tolerance": 100
+  }'
+```
+
+### Step 5: Export with Annotations
 
 ```bash
 curl -s -X POST "http://localhost:3000/drawings/{id}/export/annotated" \
@@ -92,39 +160,52 @@ curl -s -X POST "http://localhost:3000/drawings/{id}/export/annotated" \
       {"start_x": -117779, "start_y": 28270, "end_x": -115379, "end_y": 28270, "value": 2400, "color": "red"}
     ],
     "unit_format": "m",
-    "backend": "ezdxf"
+    "backend": "cairo"
   }'
 ```
 
 ## Key API Endpoints
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /drawings` | List loaded drawings |
-| `GET /drawings/{id}/regions` | Get detected diagram regions |
-| `GET /drawings/{id}/blocks` | Get fixture blocks (furniture, sanitary) |
-| `GET /drawings/{id}/geometry` | Get raw geometry (lines, arcs) |
-| `GET /drawings/{id}/annotations` | Get text labels |
-| `POST /drawings/{id}/export` | Export image with optional region crop |
-| `POST /drawings/{id}/export/annotated` | Export with measurements and boundaries |
+| Endpoint                                    | Purpose                                                  |
+| ------------------------------------------- | -------------------------------------------------------- |
+| `GET /drawings`                             | List loaded drawings                                     |
+| `GET /drawings/{id}/regions`                | Get detected diagram regions                             |
+| `GET /drawings/{id}/blocks`                 | Get fixture blocks (furniture, sanitary)                 |
+| `GET /drawings/{id}/blocks/{name}/contents` | **NEW** Explode block to see internal geometry           |
+| `GET /drawings/{id}/geometry`               | Get raw geometry (lines, arcs)                           |
+| `GET /drawings/{id}/polylines`              | **NEW** Get polyline entities with points and closure    |
+| `GET /drawings/{id}/entities`               | **NEW** Unified entity list with hierarchical model      |
+| `GET /drawings/{id}/annotations`            | Get text labels                                          |
+| `POST /drawings/{id}/entities/query`        | **NEW** Spatial query with filtering and block explosion |
+| `POST /drawings/{id}/boundaries/detect`     | **NEW** Detect closed room boundaries                    |
+| `POST /drawings/{id}/export`                | Export image (backends: cairo, librecad)                 |
+| `POST /drawings/{id}/export/annotated`      | Export with measurements and boundaries                  |
+
+## Render Backends
+
+| Backend    | Description                                                           |
+| ---------- | --------------------------------------------------------------------- |
+| `cairo`    | Default - accurate Python-native renderer, handles all entity types   |
+| `librecad` | High quality for complex hatches, requires LibreCAD installed         |
 
 ## Common Room Types and Fixture Layers
 
-| Room Type | Fixture Layers | Block Types |
-|-----------|---------------|-------------|
-| Bathroom | WC, SANITARY | Toilet, sink, bathtub |
-| Kitchen | FURNITURE, APPLIANCES | Stove, fridge, sink |
-| Bedroom | FURNITURE | Bed, wardrobe |
+| Room Type | Fixture Layers        | Block Keywords                             |
+| --------- | --------------------- | ------------------------------------------ |
+| Bathroom  | WC, SANITARY, BATH    | TOILET, WC, SINK, BASIN, BATH, TUB, SHOWER |
+| Kitchen   | FURNITURE, APPLIANCES | STOVE, FRIDGE, SINK, OVEN                  |
+| Bedroom   | FURNITURE             | BED, WARDROBE, CLOSET                      |
 
 ## Example Questions This Skill Handles
 
+- "How many bathrooms are in this floor plan?"
 - "What are the bathroom sizes?"
 - "How big is the master bedroom?"
 - "Show me the kitchen dimensions"
 - "What's the total floor area?"
 - "Identify all rooms in this floor plan"
+- "What fixtures are in this block?"
 
 ## Reference
 
 - `docs/API.md` - Full API documentation with all endpoints and parameters
-- `docs/llm.md` - Workflow guidance for measuring rooms and avoiding common mistakes

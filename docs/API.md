@@ -4,7 +4,7 @@ A REST API for analyzing DXF/DWG CAD drawings, extracting dimensions, annotation
 
 **Base URL:** `http://localhost:3000`
 
-> **Note:** For AI assistants - see `llm.txt` for recommended patterns when measuring room dimensions.
+> **Note:** For AI assistants - see `llm.md` for recommended patterns when measuring room dimensions.
 
 ---
 
@@ -284,6 +284,283 @@ Extract geometric entities (lines, circles, arcs).
 ]
 ```
 
+#### `GET /drawings/{drawing_id}/polylines`
+
+Extract polyline entities (LWPOLYLINE and POLYLINE) with full point data.
+
+**Query Parameters:**
+
+- `layer` (optional): Filter to specific layer
+- `closed_only` (optional): Only return closed polylines (useful for room boundaries)
+
+**Response:**
+
+```json
+[
+  {
+    "id": "PL0001",
+    "type": "lwpolyline",
+    "layer": "WALL",
+    "closed": true,
+    "points": [
+      { "x": 0.0, "y": 0.0, "z": 0.0 },
+      { "x": 5000.0, "y": 0.0, "z": 0.0 },
+      { "x": 5000.0, "y": 3000.0, "z": 0.0 },
+      { "x": 0.0, "y": 3000.0, "z": 0.0 }
+    ],
+    "total_length": 16000.0,
+    "bulges": [0.0, 0.0, 0.0, 0.0]
+  }
+]
+```
+
+#### `GET /drawings/{drawing_id}/entities`
+
+Get all entities with unified hierarchical model including bounds and properties.
+
+**Query Parameters:**
+
+- `types` (optional): Comma-separated entity types (LINE,CIRCLE,ARC,LWPOLYLINE,etc.)
+- `layer` (optional): Filter to specific layer
+- `limit` (optional): Maximum entities to return (default: 1000)
+
+**Response:**
+
+```json
+[
+  {
+    "id": "E0001",
+    "type": "line",
+    "layer": "WALL",
+    "parent_id": null,
+    "bounds": {
+      "min": { "x": 0.0, "y": 0.0, "z": 0.0 },
+      "max": { "x": 5000.0, "y": 0.0, "z": 0.0 }
+    },
+    "center": { "x": 2500.0, "y": 0.0, "z": 0.0 },
+    "properties": {
+      "start": { "x": 0.0, "y": 0.0 },
+      "end": { "x": 5000.0, "y": 0.0 }
+    }
+  }
+]
+```
+
+#### `GET /drawings/{drawing_id}/blocks/{block_name}/contents`
+
+Explode a block to see its internal geometry. Useful for understanding fixture symbols.
+
+**Response:**
+
+```json
+{
+  "block_name": "TOILET",
+  "base_point": { "x": 0.0, "y": 0.0, "z": 0.0 },
+  "entity_count": 15,
+  "entities": [
+    {
+      "id": "E0001",
+      "type": "arc",
+      "layer": "0",
+      "properties": {
+        "center": { "x": 200.0, "y": 150.0 },
+        "radius": 180.0,
+        "start_angle": 0.0,
+        "end_angle": 180.0
+      }
+    }
+  ],
+  "nested_blocks": ["TOILET_SEAT"]
+}
+```
+
+#### `POST /drawings/{drawing_id}/entities/query`
+
+Spatial query for entities within a bounding box with filtering and block explosion.
+
+**Request:**
+
+```json
+{
+  "bounds": {
+    "min": { "x": -80000, "y": 20000 },
+    "max": { "x": -70000, "y": 35000 }
+  },
+  "types": ["LINE", "LWPOLYLINE", "POLYLINE"],
+  "layers": ["WALL"],
+  "include_nested": true
+}
+```
+
+**Parameters:**
+
+- `bounds`: Required bounding box for the query
+- `types` (optional): Entity types to include
+- `layers` (optional): Layers to include
+- `include_nested` (optional): Explode blocks and include their contents (default: false)
+
+**Response:**
+
+```json
+{
+  "bounds": {
+    "min": { "x": -80000.0, "y": 20000.0 },
+    "max": { "x": -70000.0, "y": 35000.0 }
+  },
+  "entity_count": 45,
+  "entities": [
+    {
+      "id": "E0001",
+      "type": "line",
+      "layer": "WALL",
+      "parent_id": null,
+      "bounds": { ... },
+      "center": { ... },
+      "properties": { ... }
+    }
+  ],
+  "blocks_exploded": 3
+}
+```
+
+#### `POST /drawings/{drawing_id}/boundaries/detect`
+
+Detect closed boundaries (potential room perimeters) from wall geometry.
+
+**Request:**
+
+```json
+{
+  "region": {
+    "min": { "x": -80000, "y": 20000 },
+    "max": { "x": -70000, "y": 35000 }
+  },
+  "layers": ["WALL", "MURO"],
+  "min_area": 1000000,
+  "max_area": 100000000000,
+  "tolerance": 100
+}
+```
+
+**Parameters:**
+
+- `region` (optional): Limit detection to a region
+- `layers` (optional): Layers to analyze (default: common wall layer names)
+- `min_area` (optional): Minimum boundary area in square drawing units
+- `max_area` (optional): Maximum boundary area
+- `tolerance` (optional): Gap tolerance for closing boundaries
+
+**Response:**
+
+```json
+{
+  "boundaries": [
+    {
+      "id": "B001",
+      "vertices": [
+        { "x": 0.0, "y": 0.0, "z": 0.0 },
+        { "x": 5000.0, "y": 0.0, "z": 0.0 },
+        { "x": 5000.0, "y": 3000.0, "z": 0.0 },
+        { "x": 0.0, "y": 3000.0, "z": 0.0 }
+      ],
+      "width": 5000.0,
+      "height": 3000.0,
+      "area": 15000000.0,
+      "perimeter": 16000.0,
+      "is_rectangular": true,
+      "confidence": 0.8,
+      "layer": "WALL",
+      "nearby_labels": ["BATHROOM", "WC"]
+    }
+  ],
+  "total_found": 1,
+  "layers_analyzed": ["WALL", "MURO"]
+}
+```
+
+#### `POST /drawings/{drawing_id}/enclosed-areas`
+
+Detect enclosed areas from boundary geometry with optional classification based on contained fixture blocks. This is a generic algorithm that works with any drawing type (architecture, mechanical, site plans, etc.) by configuring which layers to analyze.
+
+**Request:**
+
+```json
+{
+  "region": {
+    "min": { "x": -120000, "y": 27000 },
+    "max": { "x": -110000, "y": 35000 }
+  },
+  "layers": ["WALL"],
+  "snap_tolerance": 100,
+  "min_area": 2000000,
+  "max_area": 50000000,
+  "classify_by_blocks": true,
+  "block_layers": ["WC", "SANITARY"]
+}
+```
+
+**Parameters:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `region` | Bounds | `null` | Limit detection to a specific region |
+| `layers` | string[] | `["WALL"]` | Layers containing boundary lines |
+| `snap_tolerance` | float | `100` | Gap tolerance for connecting endpoints (in drawing units) |
+| `min_area` | float | `1000000` | Minimum enclosed area (filters out wall thickness artifacts) |
+| `max_area` | float | `500000000` | Maximum enclosed area (filters out building perimeter) |
+| `classify_by_blocks` | bool | `true` | Check for contained fixture blocks and classify |
+| `block_layers` | string[] | `null` | Layers containing fixture blocks for classification |
+
+**Response:**
+
+```json
+{
+  "enclosed_areas": [
+    {
+      "id": "EA001",
+      "polygon": [
+        { "x": -117800.0, "y": 30300.0, "z": 0.0 },
+        { "x": -115400.0, "y": 30300.0, "z": 0.0 },
+        { "x": -115400.0, "y": 28600.0, "z": 0.0 },
+        { "x": -117800.0, "y": 28600.0, "z": 0.0 }
+      ],
+      "bounds": {
+        "min": { "x": -117800.0, "y": 28600.0, "z": 0.0 },
+        "max": { "x": -115400.0, "y": 30300.0, "z": 0.0 }
+      },
+      "centroid": { "x": -116600.0, "y": 29450.0, "z": 0.0 },
+      "area": 4080000.0,
+      "perimeter": 8200.0,
+      "is_rectangular": true,
+      "aspect_ratio": 1.41,
+      "layer": "WALL",
+      "contained_blocks": ["A$C57C31BFC"],
+      "classification": "wc",
+      "nearby_labels": []
+    }
+  ],
+  "total_found": 1,
+  "layers_analyzed": ["WALL"]
+}
+```
+
+**Classification Types:**
+
+Based on contained fixture blocks, areas can be classified as:
+- `full_bathroom` - Contains toilet and bathtub/shower
+- `wc` - Contains toilet only
+- `bathroom` - Contains bathtub or shower (no toilet)
+- `kitchen` - Contains stove or fridge+sink
+
+**Use Cases by Drawing Type:**
+
+| Drawing Type | Configuration |
+|--------------|---------------|
+| Architecture rooms | `layers: ["WALL"]`, `block_layers: ["WC", "SANITARY"]` |
+| Site plan lots | `layers: ["BOUNDARY", "PROPERTY"]`, `classify_by_blocks: false` |
+| Mechanical parts | `layers: ["OUTLINE"]`, `snap_tolerance: 10` |
+| PCB board outline | `layers: ["BOARD"]`, `min_area: 100` |
+
 ---
 
 ### Semantic Analysis
@@ -470,7 +747,7 @@ This endpoint allows flexible filtering of dimensions and returns both structure
 | `image_width` | int | `2000` | Output image width in pixels |
 | `highlight_color` | string | `"red"` | Color for markers: red, blue, green, orange, purple, cyan, magenta, yellow, black |
 | `background` | string | `"white"` | Image background: white, black, transparent |
-| `backend` | string | `"librecad"` | Render backend: ezdxf or librecad |
+| `backend` | string | `"cairo"` | Render backend: cairo (default) or librecad |
 
 **Response:**
 
@@ -563,7 +840,7 @@ Export drawing or region to PNG image.
   "scale": null,
   "background": "white",
   "region": null,
-  "backend": "ezdxf"
+  "backend": "cairo"
 }
 ```
 
@@ -577,7 +854,7 @@ Export drawing or region to PNG image.
 | `scale` | float | `null` | Pixels per drawing unit |
 | `background` | string | `"white"` | `"white"`, `"black"`, or `"transparent"` |
 | `region` | Bounds | `null` | Crop to specific region |
-| `backend` | string | `"ezdxf"` | `"ezdxf"` (fast) or `"librecad"` (high quality) |
+| `backend` | string | `"cairo"` | `"cairo"` (default) or `"librecad"` (high quality) |
 
 **Response:**
 
@@ -594,7 +871,7 @@ Export drawing or region to PNG image.
     "min": { "x": -500.0, "y": -500.0, "z": 0.0 },
     "max": { "x": 15500.0, "y": 10500.0, "z": 0.0 }
   },
-  "backend": "ezdxf"
+  "backend": "cairo"
 }
 ```
 
@@ -620,7 +897,7 @@ Export a specific detected region.
 **Query Parameters:**
 
 - `width` (optional): Output width in pixels
-- `backend` (optional): `"ezdxf"` or `"librecad"`
+- `backend` (optional): `"cairo"` (default) or `"librecad"`
 
 #### `POST /drawings/{drawing_id}/export/annotated`
 
@@ -656,7 +933,7 @@ Export with measurement annotations and boundary rectangles overlaid.
     }
   ],
   "unit_format": "m",
-  "backend": "ezdxf"
+  "backend": "cairo"
 }
 ```
 
@@ -674,7 +951,7 @@ Export with measurement annotations and boundary rectangles overlaid.
   - `color` (optional): Color name. Default: red.
   - `label` (optional): Custom label text. If not provided, auto-generated from value.
 - `unit_format` (optional): `"mm"` or `"m"` - affects auto-generated labels. Default: mm.
-- `backend` (optional): `"ezdxf"` or `"librecad"` (default).
+- `backend` (optional): `"cairo"` (default) or `"librecad"`.
 
 **Response:**
 
@@ -684,7 +961,8 @@ Export with measurement annotations and boundary rectangles overlaid.
   "filename": "a1b2c3d4_annotated_1234567890.png",
   "width": 2000,
   "height": 1500,
-  "measurements_drawn": 1
+  "measurements_drawn": 1,
+  "boundaries_drawn": 1
 }
 ```
 
@@ -698,18 +976,25 @@ Serve an exported PNG file.
 
 ## Render Backends
 
-### ezdxf (Default)
+### cairo (Default)
 
-- Fast rendering using matplotlib
-- Good for quick previews
-- May miss some complex entities
+- Python-native renderer using PyCairo
+- Handles all standard entity types including:
+  - LINE, LWPOLYLINE, POLYLINE, SPLINE
+  - CIRCLE, ARC, ELLIPSE
+  - TEXT, MTEXT
+  - INSERT (with block explosion)
+  - DIMENSION
+  - HATCH, SOLID, 3DFACE
+- No external dependencies beyond pycairo
+- Recommended for most use cases
 
 ### librecad (High Quality)
 
 - Uses LibreCAD's `dxf2pdf` for accurate rendering
 - Requires LibreCAD and poppler (pdftoppm) installed
-- Better handling of complex drawings
-- Recommended for final exports
+- Better handling of complex hatches
+- Use when Cairo output is insufficient
 
 ---
 
@@ -972,7 +1257,7 @@ All measurements are in drawing units (typically millimeters for architectural d
 
 ## Dependencies
 
-- **Required:** Python 3.9+, FastAPI, ezdxf, matplotlib, Pillow
+- **Required:** Python 3.9+, FastAPI, ezdxf, pycairo, Pillow
 - **Optional (for high-quality export):** LibreCAD, poppler-utils (pdftoppm)
 - **Optional (for DWG support):** ODA File Converter
 
@@ -1024,7 +1309,7 @@ If the drawing contains ACAD_PROXY_ENTITY, the proxy graphics may not contain re
    - Download from [ODA](https://www.opendesign.com/guestfiles/oda_file_converter)
    - Convert DWG to DXF which may flatten some proxy objects
 
-### Entity Types Supported by ezdxf Backend
+### Entity Types Supported by Cairo Backend
 
 | Entity Type       | Rendered | Notes                                    |
 | ----------------- | -------- | ---------------------------------------- |

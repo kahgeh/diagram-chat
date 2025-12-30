@@ -1,16 +1,12 @@
 """DXF API Server - Exposes DXF drawing data for AI agents."""
 import ezdxf
 from ezdxf import bbox as ezdxf_bbox
-from ezdxf.addons.drawing import RenderContext, Frontend
-from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from collections import defaultdict
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
-import matplotlib.pyplot as plt
+import json
 import math
 import os
 import platform
@@ -19,6 +15,16 @@ import tempfile
 import uuid
 import shutil
 from enum import Enum
+
+# Import Cairo renderer
+try:
+    from cairo_renderer import (
+        CairoRenderer, RenderBounds, render_dxf_to_png, render_dxf_to_svg
+    )
+    CAIRO_AVAILABLE = True
+except ImportError:
+    CAIRO_AVAILABLE = False
+    print("Warning: Cairo renderer not available. Install pycairo for accurate rendering.")
 
 app = FastAPI(title="DXF API", description="API for accessing DXF/DWG drawing data for AI agents")
 
@@ -268,8 +274,8 @@ class ExtentsInfo(BaseModel):
 
 class RenderBackend(str, Enum):
     """Render backend for PNG export."""
-    EZDXF = "ezdxf"  # Fast, but may miss some entity types (ACAD_PROXY_ENTITY, complex hatches)
-    LIBRECAD = "librecad"  # Higher quality, renders most entities correctly
+    CAIRO = "cairo"  # Accurate Python-native renderer, supports all entity types (default)
+    LIBRECAD = "librecad"  # Higher quality for complex hatches (requires LibreCAD installed)
 
 
 class ExportRequest(BaseModel):
@@ -280,7 +286,7 @@ class ExportRequest(BaseModel):
     scale: Optional[float] = None  # Pixels per drawing unit (e.g., 0.1 = 1px per 10mm)
     background: str = "white"
     region: Optional[Bounds] = None
-    backend: RenderBackend = RenderBackend.EZDXF  # Render backend to use
+    backend: RenderBackend = RenderBackend.CAIRO  # Render backend to use
 
 
 class ExportResponse(BaseModel):
@@ -373,7 +379,7 @@ class AnnotatedExportRequest(BaseModel):
     measurements: list[MeasurementAnnotation] = []  # Measurements to annotate
     boundaries: list[BoundaryRectangle] = []  # Boundary rectangles to draw
     unit_format: Optional[str] = "mm"  # "mm" or "m" - affects auto-generated labels
-    backend: RenderBackend = RenderBackend.LIBRECAD
+    backend: RenderBackend = RenderBackend.CAIRO
 
 
 class AnnotatedExportResponse(BaseModel):
@@ -382,6 +388,7 @@ class AnnotatedExportResponse(BaseModel):
     width: int
     height: int
     measurements_drawn: int
+    boundaries_drawn: int
 
 
 # ============== MEASUREMENTS QUERY MODELS ==============
@@ -409,7 +416,7 @@ class MeasurementOutputOptions(BaseModel):
     image_width: int = 2000  # Pixel width
     highlight_color: str = "red"  # Color for marking dimensions
     background: str = "white"  # white, black, or transparent
-    backend: RenderBackend = RenderBackend.LIBRECAD  # Render backend
+    backend: RenderBackend = RenderBackend.CAIRO  # Render backend
 
 
 class MeasurementsQueryRequest(BaseModel):
@@ -450,6 +457,119 @@ class MeasurementsQueryResponse(BaseModel):
     dimensions: list[DimensionInfo]
     statistics: MeasurementStatistics
     image: Optional[ImageOutput] = None
+
+
+# ============== NEW ENHANCED API MODELS ==============
+
+class PolylineInfo(BaseModel):
+    """Information about a polyline entity (LWPOLYLINE or POLYLINE)."""
+    id: str
+    type: str  # lwpolyline or polyline
+    layer: str
+    closed: bool
+    points: list[Point]
+    total_length: float
+    bulges: Optional[list[float]] = None  # Arc bulge values for LWPOLYLINE
+
+
+class EntityInfo(BaseModel):
+    """Unified entity information with parent-child relationships."""
+    id: str
+    type: str
+    layer: str
+    parent_id: Optional[str] = None  # For entities inside blocks
+    bounds: Optional[Bounds] = None
+    center: Optional[Point] = None
+    properties: dict = {}  # Type-specific properties
+
+
+class BlockContentsResponse(BaseModel):
+    """Contents of an exploded block."""
+    block_name: str
+    base_point: Point
+    entity_count: int
+    entities: list[EntityInfo]
+    nested_blocks: list[str]
+
+
+class SpatialQueryRequest(BaseModel):
+    """Request for spatial entity query."""
+    bounds: Bounds
+    types: Optional[list[str]] = None  # LINE, ARC, CIRCLE, INSERT, TEXT, etc.
+    layers: Optional[list[str]] = None
+    include_nested: bool = False  # Explode blocks and include contents
+
+
+class SpatialQueryResponse(BaseModel):
+    """Response from spatial query."""
+    bounds: Bounds
+    entity_count: int
+    entities: list[EntityInfo]
+    blocks_exploded: int
+
+
+class ClosedBoundary(BaseModel):
+    """A detected closed boundary (potential room perimeter)."""
+    id: str
+    vertices: list[Point]
+    width: float
+    height: float
+    area: float
+    perimeter: float
+    is_rectangular: bool
+    confidence: float  # 0-1 confidence score
+    layer: str
+    nearby_labels: list[str]
+
+
+class BoundaryDetectionRequest(BaseModel):
+    """Request for closed boundary detection."""
+    region: Optional[Bounds] = None  # Limit to region
+    layers: Optional[list[str]] = None  # Layers to analyze (default: wall layers)
+    min_area: float = 1000000  # Minimum area in square drawing units
+    max_area: float = 100000000000  # Maximum area
+    tolerance: float = 100  # Gap tolerance for closing boundaries
+
+
+class BoundaryDetectionResponse(BaseModel):
+    """Response from boundary detection."""
+    boundaries: list[ClosedBoundary]
+    total_found: int
+    layers_analyzed: list[str]
+
+
+class EnclosedArea(BaseModel):
+    """A detected enclosed area with classification."""
+    id: str
+    polygon: list[Point]
+    bounds: Bounds
+    centroid: Point
+    area: float
+    perimeter: float
+    is_rectangular: bool
+    aspect_ratio: float
+    layer: str
+    contained_blocks: list[str]
+    classification: Optional[str] = None
+    nearby_labels: list[str]
+
+
+class EnclosedAreasRequest(BaseModel):
+    """Request for enclosed area detection."""
+    region: Optional[Bounds] = None
+    layers: Optional[list[str]] = None  # Layers with boundary lines (default: ["WALL"])
+    snap_tolerance: float = 100  # Gap tolerance for connecting endpoints
+    min_area: float = 1000000  # Filter tiny areas (wall thickness artifacts)
+    max_area: float = 500000000  # Filter huge areas (building perimeter)
+    classify_by_blocks: bool = True  # Check for contained blocks and classify
+    block_layers: Optional[list[str]] = None  # Layers with fixture blocks
+
+
+class EnclosedAreasResponse(BaseModel):
+    """Response from enclosed area detection."""
+    enclosed_areas: list[EnclosedArea]
+    total_found: int
+    layers_analyzed: list[str]
 
 
 @app.on_event("startup")
@@ -520,7 +640,7 @@ def get_entity_bounds(entity, cache):
         bbox = ezdxf_bbox.extents([entity], cache=cache)
         if bbox.has_data:
             return bbox
-    except:
+    except (ValueError, TypeError, AttributeError):
         pass
     return None
 
@@ -551,6 +671,423 @@ def is_in_bounds(point, bounds, padding=0):
         return False
     return (bounds.min.x - padding <= point[0] <= bounds.max.x + padding and
             bounds.min.y - padding <= point[1] <= bounds.max.y + padding)
+
+
+def point_in_polygon(point: tuple, polygon: list) -> bool:
+    """Ray casting algorithm for point-in-polygon test."""
+    x, y = point[0], point[1]
+    n = len(polygon)
+    inside = False
+
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i][0], polygon[i][1]
+        xj, yj = polygon[j][0], polygon[j][1]
+
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+
+    return inside
+
+
+def classify_area_by_blocks(contained_blocks: list, block_layers: list) -> Optional[str]:
+    """Classify an enclosed area based on contained fixture blocks."""
+    if not contained_blocks:
+        return None
+
+    # Combine block names and layers for classification
+    identifiers = [b.lower() for b in contained_blocks]
+    identifiers.extend([layer.lower() for layer in block_layers if layer])
+
+    # Check for bathroom indicators
+    has_toilet = any(
+        'wc' in b or 'toilet' in b or 'унитаз' in b or 'sanitary' in b
+        for b in identifiers
+    )
+    has_bathtub = any(
+        'bath' in b or 'tub' in b or 'ванн' in b
+        for b in identifiers
+    )
+    has_shower = any(
+        'shower' in b or 'душ' in b
+        for b in identifiers
+    )
+
+    # Check for kitchen indicators
+    has_stove = any(
+        'stove' in b or 'плит' in b or 'печ' in b or 'oven' in b
+        for b in identifiers
+    )
+    has_fridge = any(
+        'fridge' in b or 'холодильник' in b or 'refrigerator' in b
+        for b in identifiers
+    )
+    has_sink = any(
+        'sink' in b or 'раковин' in b or 'мойк' in b
+        for b in identifiers
+    )
+
+    # Classification logic
+    if has_toilet and (has_bathtub or has_shower):
+        return "full_bathroom"
+    elif has_toilet:
+        return "wc"
+    elif has_bathtub or has_shower:
+        return "bathroom"
+    elif has_stove or (has_fridge and has_sink):
+        return "kitchen"
+
+    return None
+
+
+# ============== SHARED HELPER FUNCTIONS ==============
+
+# Dimension type mapping - shared between endpoints
+DIM_TYPE_MAP = {0: "linear", 1: "aligned", 2: "angular", 3: "diameter", 4: "radius", 5: "angular_3pt", 6: "ordinate"}
+
+
+def extract_dimension_info(entity, dim_idx: int) -> Optional[DimensionInfo]:
+    """
+    Extract dimension information from a DIMENSION entity.
+
+    Args:
+        entity: The ezdxf DIMENSION entity
+        dim_idx: Index for generating the dimension ID
+
+    Returns:
+        DimensionInfo object or None if extraction fails
+    """
+    entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+
+    dim_type_code = entity.dxf.dimtype if hasattr(entity.dxf, 'dimtype') else 0
+    dim_type = DIM_TYPE_MAP.get(dim_type_code & 0x0F, "unknown")
+
+    point_from = None
+    point_to = None
+    midpoint = None
+
+    try:
+        # For linear dimensions:
+        # - defpoint2 is the start point of the first extension line (actual measured point 1)
+        # - defpoint3 is the start point of the second extension line (actual measured point 2)
+        # - defpoint is the dimension line location, NOT a measurement point
+        p2 = entity.dxf.defpoint2
+        p3 = entity.dxf.defpoint3
+        point_from = Point(x=p2.x, y=p2.y, z=getattr(p2, 'z', 0.0))
+        point_to = Point(x=p3.x, y=p3.y, z=getattr(p3, 'z', 0.0))
+        midpoint = Point(
+            x=(p2.x + p3.x) / 2,
+            y=(p2.y + p3.y) / 2,
+            z=(getattr(p2, 'z', 0.0) + getattr(p3, 'z', 0.0)) / 2
+        )
+    except (AttributeError, TypeError):
+        pass
+
+    value = 0.0
+    if point_from and point_to:
+        dx = point_to.x - point_from.x
+        dy = point_to.y - point_from.y
+        value = math.sqrt(dx*dx + dy*dy)
+
+    display_text = None
+    try:
+        display_text = entity.dxf.text if entity.dxf.text else None
+    except (AttributeError, TypeError):
+        pass
+
+    return DimensionInfo(
+        id=f"D{dim_idx:04d}",
+        type=dim_type,
+        value=value,
+        display_text=display_text,
+        point_from=point_from,
+        point_to=point_to,
+        midpoint=midpoint,
+        layer=entity_layer
+    )
+
+
+def extract_all_dimensions(msp, layer_filter: Optional[str] = None) -> list[DimensionInfo]:
+    """
+    Extract all dimension entities from a modelspace.
+
+    Args:
+        msp: The ezdxf modelspace
+        layer_filter: Optional layer name to filter by
+
+    Returns:
+        List of DimensionInfo objects
+    """
+    dimensions = []
+    dim_idx = 0
+
+    for entity in msp:
+        if entity.dxftype() != "DIMENSION":
+            continue
+
+        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+        if layer_filter and entity_layer != layer_filter:
+            continue
+
+        dim_idx += 1
+        dim_info = extract_dimension_info(entity, dim_idx)
+        if dim_info:
+            dimensions.append(dim_info)
+
+    return dimensions
+
+
+def extract_segments_from_entities(
+    msp,
+    cache,
+    layers: list[str],
+    region: Optional[Bounds] = None
+) -> list[tuple]:
+    """
+    Extract line segments from entities in specified layers.
+
+    Args:
+        msp: The ezdxf modelspace
+        cache: The ezdxf bbox cache
+        layers: List of layer names to match (case-insensitive partial match)
+        region: Optional bounds to filter entities
+
+    Returns:
+        List of tuples: ((x1, y1), (x2, y2), layer)
+    """
+    segments = []
+
+    for entity in msp:
+        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+
+        # Check if layer matches (case-insensitive partial match)
+        layer_match = any(wl.upper() in entity_layer.upper() for wl in layers)
+        if not layer_match:
+            continue
+
+        # Filter by region if specified
+        if region:
+            try:
+                bbox = ezdxf_bbox.extents([entity], cache=cache)
+                if bbox.has_data:
+                    if (bbox.extmax.x < region.min.x or
+                        bbox.extmin.x > region.max.x or
+                        bbox.extmax.y < region.min.y or
+                        bbox.extmin.y > region.max.y):
+                        continue
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+        entity_type = entity.dxftype()
+
+        if entity_type == "LINE":
+            start = entity.dxf.start
+            end = entity.dxf.end
+            segments.append(((start.x, start.y), (end.x, end.y), entity_layer))
+
+        elif entity_type == "LWPOLYLINE":
+            points = list(entity.get_points(format='xy'))
+            for i in range(len(points) - 1):
+                segments.append((
+                    (points[i][0], points[i][1]),
+                    (points[i+1][0], points[i+1][1]),
+                    entity_layer
+                ))
+            if entity.closed and len(points) >= 2:
+                segments.append((
+                    (points[-1][0], points[-1][1]),
+                    (points[0][0], points[0][1]),
+                    entity_layer
+                ))
+
+        elif entity_type == "POLYLINE":
+            points = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+            for i in range(len(points) - 1):
+                segments.append((points[i], points[i+1], entity_layer))
+            if entity.is_closed and len(points) >= 2:
+                segments.append((points[-1], points[0], entity_layer))
+
+    return segments
+
+
+def build_segment_graph(segments: list[tuple], tolerance: float) -> dict:
+    """
+    Build an adjacency graph from line segments.
+
+    Args:
+        segments: List of ((x1, y1), (x2, y2), layer) tuples
+        tolerance: Distance tolerance for connecting endpoints
+
+    Returns:
+        Adjacency dict mapping point keys to connected points
+    """
+    def point_key(p):
+        """Round point to tolerance grid for matching."""
+        return (round(p[0] / tolerance) * tolerance,
+                round(p[1] / tolerance) * tolerance)
+
+    adjacency = defaultdict(list)
+
+    for seg in segments:
+        p1, p2, layer = seg
+        k1 = point_key(p1)
+        k2 = point_key(p2)
+        adjacency[k1].append((k2, p1, p2, layer))
+        adjacency[k2].append((k1, p2, p1, layer))
+
+    return adjacency, point_key
+
+
+def find_closed_loops(adjacency: dict, point_key_func, max_depth: int = 50) -> list:
+    """
+    Find closed loops in a segment graph using DFS.
+
+    Args:
+        adjacency: Adjacency dict from build_segment_graph
+        point_key_func: Function to compute point keys
+        max_depth: Maximum search depth
+
+    Returns:
+        List of loops, where each loop is a list of point keys
+    """
+    visited_edges = set()
+    loops = []
+
+    def find_loop(start_key):
+        """Find a closed loop starting from a node."""
+        path = [start_key]
+        visited = {start_key}
+
+        def dfs(current, depth):
+            if depth > max_depth:
+                return None
+
+            for next_key, p1, p2, layer in adjacency[current]:
+                edge = (min(current, next_key), max(current, next_key))
+                if edge in visited_edges:
+                    continue
+
+                if next_key == start_key and len(path) >= 3:
+                    return path + [next_key]
+
+                if next_key not in visited:
+                    path.append(next_key)
+                    visited.add(next_key)
+                    result = dfs(next_key, depth + 1)
+                    if result:
+                        return result
+                    path.pop()
+                    visited.remove(next_key)
+
+            return None
+
+        return dfs(start_key, 0)
+
+    for start_key in list(adjacency.keys()):
+        if len(adjacency[start_key]) >= 2:
+            loop = find_loop(start_key)
+            if loop and len(loop) >= 4:
+                # Mark edges as visited
+                for i in range(len(loop) - 1):
+                    edge = (min(loop[i], loop[i+1]), max(loop[i], loop[i+1]))
+                    visited_edges.add(edge)
+                loops.append(loop)
+
+    return loops
+
+
+def compute_polygon_properties(vertices: list[Point]) -> dict:
+    """
+    Compute geometric properties of a polygon.
+
+    Args:
+        vertices: List of Point objects forming the polygon
+
+    Returns:
+        Dict with area, perimeter, centroid, bounds, is_rectangular, aspect_ratio
+    """
+    n = len(vertices)
+    if n < 3:
+        return None
+
+    # Bounds
+    min_x = min(v.x for v in vertices)
+    max_x = max(v.x for v in vertices)
+    min_y = min(v.y for v in vertices)
+    max_y = max(v.y for v in vertices)
+    width = max_x - min_x
+    height = max_y - min_y
+
+    # Area using shoelace formula
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += vertices[i].x * vertices[j].y
+        area -= vertices[j].x * vertices[i].y
+    area = abs(area) / 2.0
+
+    # Perimeter
+    perimeter = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        dx = vertices[j].x - vertices[i].x
+        dy = vertices[j].y - vertices[i].y
+        perimeter += math.sqrt(dx*dx + dy*dy)
+
+    # Centroid
+    centroid_x = sum(v.x for v in vertices) / n
+    centroid_y = sum(v.y for v in vertices) / n
+
+    # Aspect ratio
+    aspect_ratio = max(width, height) / min(width, height) if min(width, height) > 0 else 1.0
+
+    # Check if roughly rectangular
+    is_rectangular = (n == 4 and abs(area - width * height) < area * 0.1)
+
+    return {
+        'min_x': min_x,
+        'max_x': max_x,
+        'min_y': min_y,
+        'max_y': max_y,
+        'width': width,
+        'height': height,
+        'area': area,
+        'perimeter': perimeter,
+        'centroid': Point(x=centroid_x, y=centroid_y, z=0),
+        'is_rectangular': is_rectangular,
+        'aspect_ratio': aspect_ratio
+    }
+
+
+def find_nearby_labels(msp, polygon: list[tuple], bounds: dict) -> list[str]:
+    """
+    Find text labels inside or near a polygon.
+
+    Args:
+        msp: The ezdxf modelspace
+        polygon: List of (x, y) tuples forming the polygon
+        bounds: Dict with min_x, max_x, min_y, max_y
+
+    Returns:
+        List of label strings
+    """
+    labels = []
+    for entity in msp:
+        if entity.dxftype() not in ("TEXT", "MTEXT"):
+            continue
+        try:
+            pos = entity.dxf.insert
+            if point_in_polygon((pos.x, pos.y), polygon):
+                if entity.dxftype() == "TEXT":
+                    content = entity.dxf.text
+                else:
+                    content = entity.plain_text() if hasattr(entity, 'plain_text') else entity.text
+                if content and len(content) < 50:
+                    labels.append(content)
+        except (AttributeError, TypeError):
+            pass
+    return labels
 
 
 def detect_regions(msp, cache):
@@ -757,7 +1294,7 @@ async def delete_drawing(drawing_id: str):
     if data['filepath'].startswith(UPLOAD_DIR):
         try:
             os.remove(data['filepath'])
-        except:
+        except OSError:
             pass
 
     return {"message": f"Drawing '{drawing_id}' deleted"}
@@ -842,72 +1379,7 @@ async def get_dimensions(
     """Get all dimension entities."""
     data = get_drawing(drawing_id)
     msp = data['msp']
-
-    dimensions = []
-    dim_idx = 0
-
-    for entity in msp:
-        if entity.dxftype() != "DIMENSION":
-            continue
-
-        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
-        if layer and entity_layer != layer:
-            continue
-
-        dim_idx += 1
-
-        dim_type_code = entity.dxf.dimtype if hasattr(entity.dxf, 'dimtype') else 0
-        dim_types = {0: "linear", 1: "aligned", 2: "angular", 3: "diameter", 4: "radius", 5: "angular_3pt", 6: "ordinate"}
-        dim_type = dim_types.get(dim_type_code & 0x0F, "unknown")
-
-        point_from = None
-        point_to = None
-        midpoint = None
-
-        try:
-            # For linear dimensions:
-            # - defpoint2 is the start point of the first extension line (actual measured point 1)
-            # - defpoint3 is the start point of the second extension line (actual measured point 2)
-            # - defpoint is the dimension line location, NOT a measurement point
-            p2 = entity.dxf.defpoint2
-            p3 = entity.dxf.defpoint3
-            point_from = Point(x=p2.x, y=p2.y, z=getattr(p2, 'z', 0.0))
-            point_to = Point(x=p3.x, y=p3.y, z=getattr(p3, 'z', 0.0))
-            midpoint = Point(
-                x=(p2.x + p3.x) / 2,
-                y=(p2.y + p3.y) / 2,
-                z=(getattr(p2, 'z', 0.0) + getattr(p3, 'z', 0.0)) / 2
-            )
-        except:
-            pass
-
-        value = 0.0
-        try:
-            if point_from and point_to:
-                dx = point_to.x - point_from.x
-                dy = point_to.y - point_from.y
-                value = math.sqrt(dx*dx + dy*dy)
-        except:
-            pass
-
-        display_text = None
-        try:
-            display_text = entity.dxf.text if entity.dxf.text else None
-        except:
-            pass
-
-        dimensions.append(DimensionInfo(
-            id=f"D{dim_idx:04d}",
-            type=dim_type,
-            value=value,
-            display_text=display_text,
-            point_from=point_from,
-            point_to=point_to,
-            midpoint=midpoint,
-            layer=entity_layer
-        ))
-
-    return dimensions
+    return extract_all_dimensions(msp, layer_filter=layer)
 
 
 @app.get("/drawings/{drawing_id}/annotations", response_model=list[AnnotationInfo])
@@ -948,7 +1420,7 @@ async def get_annotations(
                 pos = entity.dxf.insert
                 position = Point(x=pos.x, y=pos.y, z=getattr(pos, 'z', 0.0))
                 height = entity.dxf.char_height if hasattr(entity.dxf, 'char_height') else None
-        except:
+        except (AttributeError, TypeError):
             continue
 
         annotations.append(AnnotationInfo(
@@ -1005,7 +1477,7 @@ async def get_blocks(
                 rotation=entity.dxf.rotation if hasattr(entity.dxf, 'rotation') else 0.0,
                 layer=entity_layer
             ))
-        except:
+        except (AttributeError, TypeError):
             continue
 
     return blocks
@@ -1089,7 +1561,7 @@ async def get_geometry(
                 center = entity.dxf.center
                 geo.center = Point(x=center.x, y=center.y, z=getattr(center, 'z', 0.0))
                 geo.radius = entity.dxf.radius
-        except:
+        except (AttributeError, TypeError):
             continue
 
         geometry.append(geo)
@@ -1174,7 +1646,7 @@ def draw_measurement_annotation(
     # Try to load a font, fall back to default
     try:
         font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 20)
-    except:
+    except (OSError, IOError):
         font = ImageFont.load_default()
 
     # Get text bounding box
@@ -1441,76 +1913,39 @@ def export_with_librecad(dxf_filepath: str, output_png_path: str, width: int = 4
             return False
 
 
-def export_with_ezdxf(
+def export_with_cairo(
     doc, msp, cache,
     x_min: float, x_max: float, y_min: float, y_max: float,
     output_path: str,
     background: str = "white",
-    target_width: int = 4096
+    target_width: int = 4096,
+    layers: list[str] = None
 ) -> tuple[int, int, tuple[float, float, float, float]]:
     """
-    Export region to PNG using ezdxf matplotlib backend.
+    Export region to PNG using Cairo renderer.
 
     Returns:
         Tuple of (width, height, actual_bounds) where actual_bounds is
         (x_min, x_max, y_min, y_max) as actually rendered
     """
-    drawing_width = x_max - x_min
-    drawing_height = y_max - y_min
+    if not CAIRO_AVAILABLE:
+        raise HTTPException(
+            status_code=500,
+            detail="Cairo renderer not available. Install pycairo: pip install pycairo"
+        )
 
-    # Calculate dimensions maintaining aspect ratio
-    aspect_ratio = drawing_height / drawing_width
-    output_width = target_width
-    output_height = int(target_width * aspect_ratio)
+    bounds = RenderBounds(x_min, x_max, y_min, y_max)
+    width, height, actual_bounds = render_dxf_to_png(
+        doc, msp, output_path,
+        width=target_width,
+        bounds=bounds,
+        background=background,
+        layers=layers,
+        cache=cache
+    )
 
-    # Limit maximum size
-    max_dimension = 16384
-    if output_width > max_dimension or output_height > max_dimension:
-        reduction = max_dimension / max(output_width, output_height)
-        output_width = int(output_width * reduction)
-        output_height = int(output_height * reduction)
-
-    # Use high DPI for crisp output (300 DPI is print quality)
-    dpi = 300
-    fig_width = output_width / dpi
-    fig_height = output_height / dpi
-
-    fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
-    ax = fig.add_axes([0, 0, 1, 1])
-
-    if background == "black":
-        ax.set_facecolor('black')
-        fig.patch.set_facecolor('black')
-    elif background == "transparent":
-        fig.patch.set_alpha(0)
-        ax.patch.set_alpha(0)
-    else:
-        ax.set_facecolor('white')
-        fig.patch.set_facecolor('white')
-
-    ctx = RenderContext(doc)
-    out = MatplotlibBackend(ax)
-    Frontend(ctx, out).draw_layout(msp, finalize=True)
-
-    # Restore figure size after drawing (ezdxf may have changed it)
-    fig.set_size_inches(fig_width, fig_height)
-
-    # Set exact limits after drawing
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.axis('off')
-
-    # The actual bounds are exactly what we set since we control the figure size
-    actual_bounds = (x_min, x_max, y_min, y_max)
-
-    # Save without bbox_inches='tight' to preserve exact dimensions
-    fig.savefig(output_path, format='png', dpi=dpi,
-                facecolor=fig.get_facecolor(), edgecolor='none')
-    plt.close(fig)
-
-    from PIL import Image
-    with Image.open(output_path) as img:
-        return (img.size[0], img.size[1], actual_bounds)
+    return (width, height, (actual_bounds.x_min, actual_bounds.x_max,
+                            actual_bounds.y_min, actual_bounds.y_max))
 
 
 @app.post("/drawings/{drawing_id}/export", response_model=ExportResponse)
@@ -1518,8 +1953,8 @@ async def export_drawing(drawing_id: str, request: ExportRequest):
     """Export drawing or region to PNG image.
 
     Backend options:
-    - ezdxf: Fast, but may miss some entity types (ACAD_PROXY_ENTITY, complex hatches)
-    - librecad: Higher quality, renders most entities correctly (requires LibreCAD + poppler)
+    - cairo: Accurate Python-native rendering, supports all standard entity types (default)
+    - librecad: Higher quality for complex hatches (requires LibreCAD + poppler installed)
 
     Scale options:
     - scale: pixels per drawing unit (e.g., 0.1 means 1 pixel = 10 drawing units)
@@ -1586,14 +2021,15 @@ async def export_drawing(drawing_id: str, request: ExportRequest):
         success = export_with_librecad(dxf_filepath, temp_full_path, width=librecad_width, height=librecad_height)
 
         if not success:
-            # Fallback to ezdxf
-            backend_used = "ezdxf (fallback)"
-            actual_width, actual_height, actual_bounds = export_with_ezdxf(
+            # Fallback to cairo
+            backend_used = "cairo (fallback)"
+            actual_width, actual_height, actual_bounds = export_with_cairo(
                 doc, msp, cache,
                 x_min, x_max, y_min, y_max,
                 filepath,
                 background=request.background,
-                target_width=target_width
+                target_width=target_width,
+                layers=request.layers
             )
             # Update bounds to actual rendered bounds
             x_min, x_max, y_min, y_max = actual_bounds
@@ -1624,7 +2060,7 @@ async def export_drawing(drawing_id: str, request: ExportRequest):
                 # Remove temp file
                 try:
                     os.remove(temp_full_path)
-                except:
+                except OSError:
                     pass
             else:
                 # No region specified - LibreCAD renders with its own margins
@@ -1667,18 +2103,23 @@ async def export_drawing(drawing_id: str, request: ExportRequest):
                 # Remove temp file
                 try:
                     os.remove(temp_full_path)
-                except:
+                except OSError:
                     pass
     else:
-        # Use ezdxf matplotlib backend
-        actual_width, actual_height, actual_bounds = export_with_ezdxf(
+        # Use Cairo for accurate Python-native rendering (default)
+        if not CAIRO_AVAILABLE:
+            raise HTTPException(
+                status_code=500,
+                detail="Cairo renderer not available. Install pycairo: pip install pycairo"
+            )
+        actual_width, actual_height, actual_bounds = export_with_cairo(
             doc, msp, cache,
             x_min, x_max, y_min, y_max,
             filepath,
             background=request.background,
-            target_width=target_width
+            target_width=target_width,
+            layers=request.layers
         )
-        # Update bounds to actual rendered bounds
         x_min, x_max, y_min, y_max = actual_bounds
         drawing_width = x_max - x_min
         drawing_height = y_max - y_min
@@ -1705,7 +2146,6 @@ async def export_drawing(drawing_id: str, request: ExportRequest):
         "scale": actual_scale,
         "backend": backend_used
     }
-    import json
     with open(metadata_filepath, 'w') as f:
         json.dump(metadata, f, indent=2)
 
@@ -1741,7 +2181,7 @@ async def export_region(
     scale: Optional[float] = Query(None, description="Pixels per drawing unit"),
     width: Optional[int] = Query(None, description="Output width in pixels"),
     background: str = Query("white", description="Background color: white, black, transparent"),
-    backend: RenderBackend = Query(RenderBackend.EZDXF, description="Render backend: ezdxf (fast) or librecad (high quality)")
+    backend: RenderBackend = Query(RenderBackend.CAIRO, description="Render backend: cairo (default) or librecad (high quality)")
 ):
     """Export a specific region by ID to PNG.
 
@@ -1749,7 +2189,7 @@ async def export_region(
     Use GET /drawings/{id}/regions to see available region IDs.
 
     Backend options:
-    - ezdxf: Fast rendering, but may miss some entity types
+    - cairo: Accurate Python-native rendering (default)
     - librecad: Higher quality, renders hatches and proxy entities correctly
     """
     data = get_drawing(drawing_id)
@@ -1851,7 +2291,7 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
             x_min, x_max, y_min, y_max = actual_bounds
             try:
                 os.remove(temp_full_path)
-            except:
+            except OSError:
                 pass
         elif success:
             # Use full image with contrast enhancement
@@ -1889,14 +2329,15 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
 
             try:
                 os.remove(temp_full_path)
-            except:
+            except OSError:
                 pass
         else:
-            # Fallback to ezdxf
-            _, _, actual_bounds = export_with_ezdxf(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath)
+            # Fallback to cairo
+            _, _, actual_bounds = export_with_cairo(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath)
             x_min, x_max, y_min, y_max = actual_bounds
     else:
-        _, _, actual_bounds = export_with_ezdxf(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath)
+        # Use Cairo for accurate Python-native rendering (default)
+        _, _, actual_bounds = export_with_cairo(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath)
         x_min, x_max, y_min, y_max = actual_bounds
 
     # Now annotate with measurements and boundaries
@@ -1946,7 +2387,7 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
     # Clean up base image
     try:
         os.remove(base_filepath)
-    except:
+    except OSError:
         pass
 
     return AnnotatedExportResponse(
@@ -1954,7 +2395,8 @@ async def export_with_annotations(drawing_id: str, request: AnnotatedExportReque
         filename=annotated_filename,
         width=final_width,
         height=final_height,
-        measurements_drawn=len(request.measurements)
+        measurements_drawn=len(request.measurements),
+        boundaries_drawn=len(request.boundaries)
     )
 
 
@@ -1986,7 +2428,7 @@ async def get_regions(drawing_id: str):
                         # Sanitize content for JSON encoding
                         content = content.encode('utf-8', errors='replace').decode('utf-8')
                         nearby_labels.append(content)
-                except:
+                except (AttributeError, TypeError, UnicodeDecodeError):
                     pass
 
         contained_blocks = []
@@ -2001,7 +2443,7 @@ async def get_regions(drawing_id: str):
                     block_name = block_name.encode('utf-8', errors='replace').decode('utf-8')
                     if not block_name.startswith("*") and block_name not in contained_blocks:
                         contained_blocks.append(block_name)
-                except:
+                except (AttributeError, TypeError, UnicodeDecodeError):
                     pass
 
         result.append(RegionInfo(
@@ -2059,7 +2501,7 @@ async def get_spaces(drawing_id: str):
                         for kw in fixture_keywords:
                             if kw in block_name and block_name not in fixtures:
                                 fixtures.append(block_entity.dxf.name)
-                except:
+                except (AttributeError, TypeError):
                     pass
 
             estimated_size = 3000
@@ -2079,7 +2521,7 @@ async def get_spaces(drawing_id: str):
                 area=(estimated_size * 2) ** 2 / 1_000_000,
                 fixtures=fixtures[:10]
             ))
-        except:
+        except (AttributeError, TypeError):
             continue
 
     return spaces
@@ -2180,7 +2622,7 @@ async def query_point(drawing_id: str, query: PointQuery):
             try:
                 content = entity.dxf.text if entity_type == "TEXT" else entity.text
                 nearby_texts.append(content)
-            except:
+            except (AttributeError, TypeError):
                 pass
 
         elif entity_type == "INSERT":
@@ -2188,7 +2630,7 @@ async def query_point(drawing_id: str, query: PointQuery):
                 block_name = entity.dxf.name
                 if not block_name.startswith("*"):
                     nearby_blocks.append(block_name)
-            except:
+            except (AttributeError, TypeError):
                 pass
 
         elif entity_type == "DIMENSION":
@@ -2205,7 +2647,7 @@ async def query_point(drawing_id: str, query: PointQuery):
                     value=value,
                     layer=entity.dxf.layer
                 ))
-            except:
+            except (AttributeError, TypeError):
                 pass
 
     return PointQueryResult(
@@ -2281,7 +2723,7 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
     - **image_width**: Output image width in pixels (default: 2000)
     - **highlight_color**: Color for dimension markers (red, blue, green, etc.)
     - **background**: Image background (white, black, transparent)
-    - **backend**: Render backend (ezdxf or librecad)
+    - **backend**: Render backend (cairo or librecad)
 
     ## Response
 
@@ -2325,68 +2767,8 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
                 detail=f"Region '{filters.region_id}' not found. Available: {available}"
             )
 
-    # Get all dimensions first
-    all_dimensions = []
-    dim_idx = 0
-
-    for entity in msp:
-        if entity.dxftype() != "DIMENSION":
-            continue
-
-        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
-        dim_idx += 1
-
-        dim_type_code = entity.dxf.dimtype if hasattr(entity.dxf, 'dimtype') else 0
-        dim_types = {0: "linear", 1: "aligned", 2: "angular", 3: "diameter", 4: "radius", 5: "angular_3pt", 6: "ordinate"}
-        dim_type = dim_types.get(dim_type_code & 0x0F, "unknown")
-
-        point_from = None
-        point_to = None
-        midpoint = None
-
-        try:
-            # For linear dimensions:
-            # - defpoint2 is the start point of the first extension line (actual measured point 1)
-            # - defpoint3 is the start point of the second extension line (actual measured point 2)
-            # - defpoint is the dimension line location, NOT a measurement point
-            p2 = entity.dxf.defpoint2
-            p3 = entity.dxf.defpoint3
-            point_from = Point(x=p2.x, y=p2.y, z=getattr(p2, 'z', 0.0))
-            point_to = Point(x=p3.x, y=p3.y, z=getattr(p3, 'z', 0.0))
-            midpoint = Point(
-                x=(p2.x + p3.x) / 2,
-                y=(p2.y + p3.y) / 2,
-                z=(getattr(p2, 'z', 0.0) + getattr(p3, 'z', 0.0)) / 2
-            )
-        except:
-            pass
-
-        value = 0.0
-        try:
-            if point_from and point_to:
-                dx = point_to.x - point_from.x
-                dy = point_to.y - point_from.y
-                value = math.sqrt(dx*dx + dy*dy)
-        except:
-            pass
-
-        display_text = None
-        try:
-            display_text = entity.dxf.text if entity.dxf.text else None
-        except:
-            pass
-
-        all_dimensions.append(DimensionInfo(
-            id=f"D{dim_idx:04d}",
-            type=dim_type,
-            value=value,
-            display_text=display_text,
-            point_from=point_from,
-            point_to=point_to,
-            midpoint=midpoint,
-            layer=entity_layer
-        ))
-
+    # Get all dimensions using shared helper
+    all_dimensions = extract_all_dimensions(msp)
     total_dimensions = len(all_dimensions)
 
     # Apply filters
@@ -2509,17 +2891,18 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
                 drawing_height = y_max - y_min
                 try:
                     os.remove(temp_full_path)
-                except:
+                except OSError:
                     pass
             else:
-                # Fallback to ezdxf
-                _, _, actual_bounds = export_with_ezdxf(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath,
+                # Fallback to cairo
+                _, _, actual_bounds = export_with_cairo(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath,
                                   background=output.background, target_width=output.image_width)
                 x_min, x_max, y_min, y_max = actual_bounds
                 drawing_width = x_max - x_min
                 drawing_height = y_max - y_min
         else:
-            _, _, actual_bounds = export_with_ezdxf(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath,
+            # Use Cairo for accurate Python-native rendering (default)
+            _, _, actual_bounds = export_with_cairo(doc, msp, cache, x_min, x_max, y_min, y_max, base_filepath,
                               background=output.background, target_width=output.image_width)
             x_min, x_max, y_min, y_max = actual_bounds
             drawing_width = x_max - x_min
@@ -2571,7 +2954,7 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
         # Clean up base image
         try:
             os.remove(base_filepath)
-        except:
+        except OSError:
             pass
 
         # Calculate actual scale
@@ -2593,7 +2976,7 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
             # Clean up file since we've encoded it
             try:
                 os.remove(annotated_filepath)
-            except:
+            except OSError:
                 pass
         else:
             image_output = ImageOutput(
@@ -2614,6 +2997,686 @@ async def query_measurements(drawing_id: str, request: MeasurementsQueryRequest)
         statistics=statistics,
         image=image_output
     )
+
+
+# ============== ENHANCED API ENDPOINTS ==============
+
+@app.get("/drawings/{drawing_id}/polylines", response_model=list[PolylineInfo])
+async def get_polylines(
+    drawing_id: str,
+    layer: Optional[str] = Query(None, description="Filter by layer name"),
+    closed_only: bool = Query(False, description="Only return closed polylines")
+):
+    """
+    Get all polyline entities (LWPOLYLINE and POLYLINE).
+
+    These are commonly used for walls, room boundaries, and complex shapes.
+    Returns points, closure status, and total length.
+    """
+    data = get_drawing(drawing_id)
+    msp = data['msp']
+
+    polylines = []
+    poly_idx = 0
+
+    for entity in msp:
+        entity_type = entity.dxftype()
+        if entity_type not in ("LWPOLYLINE", "POLYLINE"):
+            continue
+
+        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+        if layer and entity_layer != layer:
+            continue
+
+        # Check if closed
+        if entity_type == "LWPOLYLINE":
+            is_closed = entity.closed
+            points_data = list(entity.get_points(format='xyseb'))  # x, y, start_width, end_width, bulge
+            points = [Point(x=p[0], y=p[1], z=0) for p in points_data]
+            bulges = [p[4] for p in points_data] if points_data else None
+        else:
+            is_closed = entity.is_closed
+            points = [Point(x=v.dxf.location.x, y=v.dxf.location.y, z=v.dxf.location.z)
+                      for v in entity.vertices]
+            bulges = None
+
+        if closed_only and not is_closed:
+            continue
+
+        if len(points) < 2:
+            continue
+
+        poly_idx += 1
+
+        # Calculate total length
+        total_length = 0.0
+        for i in range(len(points) - 1):
+            dx = points[i+1].x - points[i].x
+            dy = points[i+1].y - points[i].y
+            total_length += math.sqrt(dx*dx + dy*dy)
+
+        if is_closed and len(points) >= 2:
+            dx = points[0].x - points[-1].x
+            dy = points[0].y - points[-1].y
+            total_length += math.sqrt(dx*dx + dy*dy)
+
+        polylines.append(PolylineInfo(
+            id=f"PL{poly_idx:04d}",
+            type=entity_type.lower(),
+            layer=entity_layer,
+            closed=is_closed,
+            points=points,
+            total_length=total_length,
+            bulges=bulges
+        ))
+
+    return polylines
+
+
+@app.get("/drawings/{drawing_id}/blocks/{block_name}/contents", response_model=BlockContentsResponse)
+async def get_block_contents(drawing_id: str, block_name: str):
+    """
+    Get the contents of a block definition (explode the block).
+
+    This reveals the internal geometry of blocks like fixtures (toilets, sinks),
+    furniture, or symbols. Useful for understanding what's inside INSERT entities.
+    """
+    data = get_drawing(drawing_id)
+    doc = data['doc']
+    cache = data['cache']
+
+    # Find the block definition
+    if block_name not in doc.blocks:
+        available = [b.name for b in doc.blocks if not b.name.startswith("*")]
+        raise HTTPException(
+            status_code=404,
+            detail=f"Block '{block_name}' not found. Available blocks: {available[:20]}"
+        )
+
+    block = doc.blocks.get(block_name)
+    base_point = Point(x=0, y=0, z=0)
+
+    if hasattr(block, 'base_point'):
+        bp = block.base_point
+        base_point = Point(x=bp.x, y=bp.y, z=bp.z if hasattr(bp, 'z') else 0)
+
+    entities = []
+    nested_blocks = []
+    entity_idx = 0
+
+    for entity in block:
+        entity_type = entity.dxftype()
+        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+        entity_idx += 1
+
+        # Get bounds
+        bounds = None
+        center = None
+        try:
+            bbox = ezdxf_bbox.extents([entity], cache=cache)
+            if bbox.has_data:
+                bounds = Bounds(
+                    min=Point(x=bbox.extmin.x, y=bbox.extmin.y, z=bbox.extmin.z),
+                    max=Point(x=bbox.extmax.x, y=bbox.extmax.y, z=bbox.extmax.z)
+                )
+                center = Point(
+                    x=(bbox.extmin.x + bbox.extmax.x) / 2,
+                    y=(bbox.extmin.y + bbox.extmax.y) / 2,
+                    z=(bbox.extmin.z + bbox.extmax.z) / 2
+                )
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+        # Extract type-specific properties
+        properties = {}
+
+        if entity_type == "LINE":
+            start = entity.dxf.start
+            end = entity.dxf.end
+            properties["start"] = {"x": start.x, "y": start.y}
+            properties["end"] = {"x": end.x, "y": end.y}
+
+        elif entity_type == "CIRCLE":
+            properties["center"] = {"x": entity.dxf.center.x, "y": entity.dxf.center.y}
+            properties["radius"] = entity.dxf.radius
+
+        elif entity_type == "ARC":
+            properties["center"] = {"x": entity.dxf.center.x, "y": entity.dxf.center.y}
+            properties["radius"] = entity.dxf.radius
+            properties["start_angle"] = entity.dxf.start_angle
+            properties["end_angle"] = entity.dxf.end_angle
+
+        elif entity_type == "LWPOLYLINE":
+            points = list(entity.get_points(format='xy'))
+            properties["points"] = [{"x": p[0], "y": p[1]} for p in points]
+            properties["closed"] = entity.closed
+
+        elif entity_type == "INSERT":
+            nested_name = entity.dxf.name
+            if not nested_name.startswith("*") and nested_name not in nested_blocks:
+                nested_blocks.append(nested_name)
+            properties["block_name"] = nested_name
+            pos = entity.dxf.insert
+            properties["position"] = {"x": pos.x, "y": pos.y}
+
+        entities.append(EntityInfo(
+            id=f"E{entity_idx:04d}",
+            type=entity_type.lower(),
+            layer=entity_layer,
+            bounds=bounds,
+            center=center,
+            properties=properties
+        ))
+
+    return BlockContentsResponse(
+        block_name=block_name,
+        base_point=base_point,
+        entity_count=len(entities),
+        entities=entities,
+        nested_blocks=nested_blocks
+    )
+
+
+@app.post("/drawings/{drawing_id}/entities/query", response_model=SpatialQueryResponse)
+async def query_entities(drawing_id: str, request: SpatialQueryRequest):
+    """
+    Spatial query for entities within a bounding box.
+
+    Returns all entities that intersect the specified bounds,
+    optionally filtered by type and layer. Can explode blocks
+    to include their internal geometry.
+
+    This is the recommended way to get all geometry in a region
+    for room measurement or analysis.
+    """
+    data = get_drawing(drawing_id)
+    doc, msp, cache = data['doc'], data['msp'], data['cache']
+
+    bounds = request.bounds
+    entities = []
+    blocks_exploded = 0
+    entity_idx = 0
+
+    def process_entity(entity, parent_id=None):
+        nonlocal entity_idx, blocks_exploded
+
+        entity_type = entity.dxftype()
+        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+
+        # Filter by type
+        if request.types and entity_type.upper() not in [t.upper() for t in request.types]:
+            # Special case: if INSERT is not in types but include_nested is True,
+            # still process the block contents
+            if entity_type == "INSERT" and request.include_nested:
+                pass  # Will be handled below
+            else:
+                return
+
+        # Filter by layer
+        if request.layers and entity_layer not in request.layers:
+            return
+
+        # Check if entity is within bounds
+        try:
+            bbox = ezdxf_bbox.extents([entity], cache=cache)
+            if not bbox.has_data:
+                return
+
+            # Check intersection with query bounds
+            if (bbox.extmax.x < bounds.min.x or bbox.extmin.x > bounds.max.x or
+                bbox.extmax.y < bounds.min.y or bbox.extmin.y > bounds.max.y):
+                return
+
+            entity_bounds = Bounds(
+                min=Point(x=bbox.extmin.x, y=bbox.extmin.y, z=bbox.extmin.z),
+                max=Point(x=bbox.extmax.x, y=bbox.extmax.y, z=bbox.extmax.z)
+            )
+            entity_center = Point(
+                x=(bbox.extmin.x + bbox.extmax.x) / 2,
+                y=(bbox.extmin.y + bbox.extmax.y) / 2,
+                z=(bbox.extmin.z + bbox.extmax.z) / 2
+            )
+        except (ValueError, TypeError, AttributeError):
+            entity_bounds = None
+            entity_center = None
+
+        entity_idx += 1
+
+        # Extract properties
+        properties = {}
+
+        if entity_type == "LINE":
+            start = entity.dxf.start
+            end = entity.dxf.end
+            properties["start"] = {"x": start.x, "y": start.y}
+            properties["end"] = {"x": end.x, "y": end.y}
+            dx = end.x - start.x
+            dy = end.y - start.y
+            properties["length"] = math.sqrt(dx*dx + dy*dy)
+
+        elif entity_type == "CIRCLE":
+            properties["center"] = {"x": entity.dxf.center.x, "y": entity.dxf.center.y}
+            properties["radius"] = entity.dxf.radius
+
+        elif entity_type == "ARC":
+            properties["center"] = {"x": entity.dxf.center.x, "y": entity.dxf.center.y}
+            properties["radius"] = entity.dxf.radius
+            properties["start_angle"] = entity.dxf.start_angle
+            properties["end_angle"] = entity.dxf.end_angle
+
+        elif entity_type == "LWPOLYLINE":
+            points = list(entity.get_points(format='xy'))
+            properties["points"] = [{"x": p[0], "y": p[1]} for p in points]
+            properties["closed"] = entity.closed
+
+        elif entity_type in ("TEXT", "MTEXT"):
+            content = entity.dxf.text if entity_type == "TEXT" else entity.text
+            properties["content"] = content
+            pos = entity.dxf.insert
+            properties["position"] = {"x": pos.x, "y": pos.y}
+
+        elif entity_type == "INSERT":
+            block_name = entity.dxf.name
+            properties["block_name"] = block_name
+            pos = entity.dxf.insert
+            properties["position"] = {"x": pos.x, "y": pos.y}
+            properties["rotation"] = entity.dxf.rotation if hasattr(entity.dxf, 'rotation') else 0
+            properties["scale"] = entity.dxf.xscale if hasattr(entity.dxf, 'xscale') else 1.0
+
+        # Add to results (if type filter passes or it's an INSERT we're exploding)
+        should_add = True
+        if request.types and entity_type.upper() not in [t.upper() for t in request.types]:
+            should_add = False
+
+        if should_add:
+            entities.append(EntityInfo(
+                id=f"E{entity_idx:04d}",
+                type=entity_type.lower(),
+                layer=entity_layer,
+                parent_id=parent_id,
+                bounds=entity_bounds,
+                center=entity_center,
+                properties=properties
+            ))
+
+        # Handle block explosion
+        if entity_type == "INSERT" and request.include_nested:
+            block_name = entity.dxf.name
+            if block_name.startswith("*"):
+                return
+
+            if block_name in doc.blocks:
+                blocks_exploded += 1
+                block = doc.blocks.get(block_name)
+                current_parent_id = f"E{entity_idx:04d}"
+
+                for block_entity in block:
+                    # Transform block entity coordinates
+                    # (simplified - full transformation would include rotation/scale)
+                    process_entity(block_entity, parent_id=current_parent_id)
+
+    # Process all entities in modelspace
+    for entity in msp:
+        process_entity(entity)
+
+    return SpatialQueryResponse(
+        bounds=bounds,
+        entity_count=len(entities),
+        entities=entities,
+        blocks_exploded=blocks_exploded
+    )
+
+
+@app.post("/drawings/{drawing_id}/boundaries/detect", response_model=BoundaryDetectionResponse)
+async def detect_boundaries(drawing_id: str, request: BoundaryDetectionRequest):
+    """
+    Detect closed boundaries (potential room perimeters) in the drawing.
+
+    This endpoint analyzes wall geometry to find closed polygons that could
+    represent rooms. It uses connected line segment analysis to identify
+    closed loops.
+
+    The algorithm:
+    1. Extracts line/polyline entities from wall layers
+    2. Builds a graph of connected line segments
+    3. Finds closed loops in the graph
+    4. Filters by area and validates as potential rooms
+    """
+    data = get_drawing(drawing_id)
+    msp, cache = data['msp'], data['cache']
+
+    # Default wall layers if not specified
+    wall_layers = request.layers or ["WALL", "MURO", "WALLS", "A-WALL", "A-WALL-FULL"]
+
+    # Extract segments using shared helper
+    segments = extract_segments_from_entities(msp, cache, wall_layers, request.region)
+
+    if not segments:
+        return BoundaryDetectionResponse(
+            boundaries=[],
+            total_found=0,
+            layers_analyzed=wall_layers
+        )
+
+    # Build graph and find loops using shared helpers
+    adjacency, point_key = build_segment_graph(segments, request.tolerance)
+    loops = find_closed_loops(adjacency, point_key)
+
+    # Process loops into boundaries
+    boundaries = []
+    boundary_idx = 0
+
+    for loop in loops:
+        # Convert to vertices
+        vertices = [Point(x=p[0], y=p[1], z=0) for p in loop[:-1]]
+
+        # Compute polygon properties using shared helper
+        props = compute_polygon_properties(vertices)
+        if not props:
+            continue
+
+        # Filter by area
+        if props['area'] < request.min_area or props['area'] > request.max_area:
+            continue
+
+        # Find nearby labels - use simple bounds check for this endpoint
+        nearby_labels = []
+        for entity in msp:
+            if entity.dxftype() not in ("TEXT", "MTEXT"):
+                continue
+            try:
+                pos = entity.dxf.insert
+                if (props['min_x'] <= pos.x <= props['max_x'] and
+                    props['min_y'] <= pos.y <= props['max_y']):
+                    content = entity.dxf.text if entity.dxftype() == "TEXT" else entity.text
+                    if content and len(content) < 50:
+                        nearby_labels.append(content)
+            except (AttributeError, TypeError):
+                pass
+
+        # Determine layer (most common among segments)
+        segment_layers = []
+        for i in range(len(loop) - 1):
+            k1, k2 = loop[i], loop[i+1]
+            for nk, p1, p2, layer in adjacency[k1]:
+                if point_key(p2) == k2 or point_key(p1) == k2:
+                    segment_layers.append(layer)
+                    break
+
+        most_common_layer = max(set(segment_layers), key=segment_layers.count) if segment_layers else "unknown"
+
+        boundary_idx += 1
+        boundaries.append(ClosedBoundary(
+            id=f"B{boundary_idx:03d}",
+            vertices=vertices,
+            width=props['width'],
+            height=props['height'],
+            area=props['area'],
+            perimeter=props['perimeter'],
+            is_rectangular=props['is_rectangular'],
+            confidence=0.8 if props['is_rectangular'] else 0.6,
+            layer=most_common_layer,
+            nearby_labels=nearby_labels[:5]
+        ))
+
+    return BoundaryDetectionResponse(
+        boundaries=boundaries,
+        total_found=len(boundaries),
+        layers_analyzed=wall_layers
+    )
+
+
+@app.post("/drawings/{drawing_id}/enclosed-areas", response_model=EnclosedAreasResponse)
+async def detect_enclosed_areas(drawing_id: str, request: EnclosedAreasRequest):
+    """
+    Detect enclosed areas from boundary geometry with optional classification.
+
+    This is a generic algorithm that works with any drawing type:
+    - Architecture: layers=["WALL"], block_layers=["WC", "SANITARY", "FURNITURE"]
+    - Mechanical: layers=["OUTLINE"], classify_by_blocks=False
+    - Site plans: layers=["BOUNDARY", "PROPERTY"], adjust tolerances
+
+    The algorithm:
+    1. Extracts line/polyline entities from specified layers
+    2. Builds a graph of connected line segments with snap tolerance
+    3. Finds closed loops using DFS
+    4. Filters by area constraints
+    5. Optionally finds contained blocks and classifies areas
+    """
+    data = get_drawing(drawing_id)
+    msp, cache = data['msp'], data['cache']
+
+    # Default layers if not specified
+    boundary_layers = request.layers or ["WALL", "MURO", "WALLS", "A-WALL", "A-WALL-FULL"]
+    block_layers = request.block_layers or ["WC", "SANITARY", "FURNITURE", "APPLIANCES"]
+    tolerance = request.snap_tolerance
+
+    # Extract segments using shared helper
+    segments = extract_segments_from_entities(msp, cache, boundary_layers, request.region)
+
+    if not segments:
+        return EnclosedAreasResponse(
+            enclosed_areas=[],
+            total_found=0,
+            layers_analyzed=boundary_layers
+        )
+
+    # Collect blocks for classification (if enabled)
+    blocks_for_classification = []
+    if request.classify_by_blocks:
+        for entity in msp:
+            if entity.dxftype() != "INSERT":
+                continue
+            entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+
+            # Check if on a block layer
+            layer_match = any(bl.upper() in entity_layer.upper() for bl in block_layers)
+
+            if layer_match:
+                try:
+                    pos = entity.dxf.insert
+                    block_name = entity.dxf.name
+                    blocks_for_classification.append({
+                        'name': block_name,
+                        'layer': entity_layer,
+                        'position': (pos.x, pos.y)
+                    })
+                except (AttributeError, TypeError):
+                    pass
+
+    # Build graph and find loops using shared helpers
+    adjacency, point_key = build_segment_graph(segments, tolerance)
+    loops = find_closed_loops(adjacency, point_key)
+
+    # Process loops into enclosed areas (with limits)
+    enclosed_areas = []
+    area_idx = 0
+    max_areas = 100
+
+    for loop in loops:
+        if len(enclosed_areas) >= max_areas:
+            break
+
+        # Convert to polygon coordinates
+        polygon = [(p[0], p[1]) for p in loop[:-1]]
+        vertices = [Point(x=p[0], y=p[1], z=0) for p in polygon]
+
+        # Compute polygon properties using shared helper
+        props = compute_polygon_properties(vertices)
+        if not props:
+            continue
+
+        # Filter by area
+        if props['area'] < request.min_area or props['area'] > request.max_area:
+            continue
+
+        # Find contained blocks (use expanded bounds for more lenient detection)
+        contained_blocks = []
+        contained_block_layers = []
+        if request.classify_by_blocks:
+            for block in blocks_for_classification:
+                bx, by = block['position']
+                if (props['min_x'] - tolerance <= bx <= props['max_x'] + tolerance and
+                    props['min_y'] - tolerance <= by <= props['max_y'] + tolerance):
+                    contained_blocks.append(block['name'])
+                    contained_block_layers.append(block['layer'])
+
+        # Classify area based on contained blocks
+        classification = None
+        if request.classify_by_blocks and contained_blocks:
+            classification = classify_area_by_blocks(contained_blocks, contained_block_layers)
+
+        # Find nearby labels using shared helper
+        nearby_labels = find_nearby_labels(msp, polygon, props)
+
+        # Determine layer (most common among segments)
+        segment_layers = []
+        for i in range(len(loop) - 1):
+            k1, k2 = loop[i], loop[i+1]
+            for nk, p1, p2, layer in adjacency[k1]:
+                if point_key(p2) == k2 or point_key(p1) == k2:
+                    segment_layers.append(layer)
+                    break
+
+        most_common_layer = max(set(segment_layers), key=segment_layers.count) if segment_layers else "unknown"
+
+        area_idx += 1
+        enclosed_areas.append(EnclosedArea(
+            id=f"EA{area_idx:03d}",
+            polygon=vertices,
+            bounds=Bounds(
+                min=Point(x=props['min_x'], y=props['min_y'], z=0),
+                max=Point(x=props['max_x'], y=props['max_y'], z=0)
+            ),
+            centroid=props['centroid'],
+            area=props['area'],
+            perimeter=props['perimeter'],
+            is_rectangular=props['is_rectangular'],
+            aspect_ratio=props['aspect_ratio'],
+            layer=most_common_layer,
+            contained_blocks=contained_blocks[:20],
+            classification=classification,
+            nearby_labels=nearby_labels[:10]
+        ))
+
+    return EnclosedAreasResponse(
+        enclosed_areas=enclosed_areas,
+        total_found=len(enclosed_areas),
+        layers_analyzed=boundary_layers
+    )
+
+
+@app.get("/drawings/{drawing_id}/entities", response_model=list[EntityInfo])
+async def get_all_entities(
+    drawing_id: str,
+    types: Optional[str] = Query(None, description="Comma-separated entity types (LINE,CIRCLE,ARC,etc)"),
+    layer: Optional[str] = Query(None, description="Filter by layer name"),
+    limit: int = Query(1000, description="Maximum number of entities to return")
+):
+    """
+    Get all entities with unified hierarchical model.
+
+    Returns entities with bounds, center points, and type-specific properties.
+    Use this for comprehensive access to drawing data.
+    """
+    data = get_drawing(drawing_id)
+    msp, cache = data['msp'], data['cache']
+
+    type_list = [t.strip().upper() for t in types.split(",")] if types else None
+
+    entities = []
+    entity_idx = 0
+
+    for entity in msp:
+        if entity_idx >= limit:
+            break
+
+        entity_type = entity.dxftype()
+        entity_layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
+
+        if type_list and entity_type not in type_list:
+            continue
+
+        if layer and entity_layer != layer:
+            continue
+
+        entity_idx += 1
+
+        # Get bounds
+        bounds = None
+        center = None
+        try:
+            bbox = ezdxf_bbox.extents([entity], cache=cache)
+            if bbox.has_data:
+                bounds = Bounds(
+                    min=Point(x=bbox.extmin.x, y=bbox.extmin.y, z=bbox.extmin.z),
+                    max=Point(x=bbox.extmax.x, y=bbox.extmax.y, z=bbox.extmax.z)
+                )
+                center = Point(
+                    x=(bbox.extmin.x + bbox.extmax.x) / 2,
+                    y=(bbox.extmin.y + bbox.extmax.y) / 2,
+                    z=(bbox.extmin.z + bbox.extmax.z) / 2
+                )
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+        # Extract properties
+        properties = {}
+
+        if entity_type == "LINE":
+            start = entity.dxf.start
+            end = entity.dxf.end
+            properties["start"] = {"x": start.x, "y": start.y}
+            properties["end"] = {"x": end.x, "y": end.y}
+
+        elif entity_type == "CIRCLE":
+            properties["center"] = {"x": entity.dxf.center.x, "y": entity.dxf.center.y}
+            properties["radius"] = entity.dxf.radius
+
+        elif entity_type == "ARC":
+            properties["center"] = {"x": entity.dxf.center.x, "y": entity.dxf.center.y}
+            properties["radius"] = entity.dxf.radius
+            properties["start_angle"] = entity.dxf.start_angle
+            properties["end_angle"] = entity.dxf.end_angle
+
+        elif entity_type == "LWPOLYLINE":
+            points = list(entity.get_points(format='xy'))
+            properties["point_count"] = len(points)
+            properties["closed"] = entity.closed
+
+        elif entity_type == "POLYLINE":
+            properties["point_count"] = len(list(entity.vertices))
+            properties["closed"] = entity.is_closed
+
+        elif entity_type in ("TEXT", "MTEXT"):
+            content = entity.dxf.text if entity_type == "TEXT" else entity.text
+            properties["content"] = content
+
+        elif entity_type == "INSERT":
+            properties["block_name"] = entity.dxf.name
+            pos = entity.dxf.insert
+            properties["position"] = {"x": pos.x, "y": pos.y}
+
+        elif entity_type == "DIMENSION":
+            try:
+                p2 = entity.dxf.defpoint2
+                p3 = entity.dxf.defpoint3
+                dx = p3.x - p2.x
+                dy = p3.y - p2.y
+                properties["value"] = math.sqrt(dx*dx + dy*dy)
+            except (AttributeError, TypeError):
+                pass
+
+        entities.append(EntityInfo(
+            id=f"E{entity_idx:04d}",
+            type=entity_type.lower(),
+            layer=entity_layer,
+            bounds=bounds,
+            center=center,
+            properties=properties
+        ))
+
+    return entities
 
 
 if __name__ == "__main__":
